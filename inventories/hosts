@@ -4,3 +4,4 @@ localhost ansible_connection=local ansible_python_interpreter=/usr/bin/python3
 [all:vars]
 tfgrid_dir="../../../tfgrid-k3s"
 kubeconfig="{{ tfgrid_dir }}/k3s.yaml"
+k3s_config_path="{{ playbook_dir }}/config/k3s.yaml"

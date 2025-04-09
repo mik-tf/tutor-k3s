@@ -1,0 +1,146 @@
+---
+# System role - handles system configuration and file descriptor limits
+
+- name: Configure system settings for Open edX
+  hosts: all
+  tasks:
+
+    - name: Debug K3s config path
+      debug:
+        msg: "K3s config path: {{ k3s_config_path }}"
+
+    - name: Check if limits directory exists
+      ansible.builtin.file:
+        path: /etc/security/limits.d
+        state: directory
+        mode: '0755'
+      become: true
+
+    - name: Create Open edX limits file
+      ansible.builtin.copy:
+        content: |
+          * soft nofile 65535
+          * hard nofile 65535
+          root soft nofile 65535
+          root hard nofile 65535
+        dest: /etc/security/limits.d/99-openedx-limits.conf
+        mode: '0644'
+      become: true
+      notify: restart k3s
+
+    - name: Check if sysctl conf exists
+      ansible.builtin.stat:
+        path: /etc/sysctl.conf
+      register: sysctl_conf
+
+    - name: Add sysctl settings for Open edX
+      ansible.builtin.lineinfile:
+        path: /etc/sysctl.conf
+        line: "{{ item }}"
+        state: present
+        create: true
+      with_items:
+        - fs.file-max = 2097152
+        - vm.max_map_count = 262144
+      become: true
+      notify: reload sysctl
+
+    - name: Create sysctl.d directory if it doesn't exist
+      ansible.builtin.file:
+        path: /etc/sysctl.d
+        state: directory
+        mode: '0755'
+      become: true
+
+    - name: Create Open edX sysctl config
+      ansible.builtin.copy:
+        content: |
+          fs.file-max = 2097152
+          vm.max_map_count = 262144
+        dest: /etc/sysctl.d/99-openedx.conf
+        mode: '0644'
+      become: true
+      notify: reload sysctl
+
+    - name: Check if systemd conf exists
+      ansible.builtin.stat:
+        path: /etc/systemd/system.conf
+      register: systemd_conf
+
+    - name: Add systemd settings for Open edX
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/system.conf
+        line: "{{ item }}"
+        state: present
+        create: true
+      with_items:
+        - DefaultLimitNOFILE=65535
+        - DefaultLimitNPROC=65535
+      become: true
+
+    - name: Create systemd override directory if it doesn't exist
+      ansible.builtin.file:
+        path: /etc/systemd/system/k3s.service.d
+        state: directory
+        mode: '0755'
+      become: true
+
+    - name: Create k3s service override
+      ansible.builtin.copy:
+        content: |
+          [Service]
+          TasksMax=infinity
+          MemoryMax=infinity
+          CPUQuota=infinity
+          NoNewPrivileges=true
+        dest: /etc/systemd/system/k3s.service.d/override.conf
+        mode: '0644'
+      become: true
+      notify: restart k3s
+
+    - name: Create Docker registry credentials secret
+      environment:
+        KUBECONFIG: "/home/pcone/Documents/temp/ws11/tutor-k3s-ansible/config/k3s.yaml"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: registry-credentials
+            namespace: openedx
+          type: kubernetes.io/dockerconfigjson
+          data:
+            .dockerconfigjson: >-
+              {{ lookup('ansible.builtin.template', '../templates/docker-config.json.j2') | to_json | b64encode }}
+      register: secret_result
+
+    - name: Ensure pods use the registry credentials
+      environment:
+        KUBECONFIG: "/home/pcone/Documents/temp/ws11/tutor-k3s-ansible/config/k3s.yaml"
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: default
+            namespace: openedx
+          imagePullSecrets:
+            - name: registry-credentials
+      when: secret_result is defined and secret_result.changed
+
+    - name: Show registry credentials status
+      debug:
+        msg: "Docker registry credentials configured successfully"
+      when: secret_result is defined and secret_result.changed
+
+  handlers:
+    - name: restart k3s
+      ansible.builtin.service:
+        name: k3s
+        state: restarted
+      become: true
+
+    - name: reload sysctl
+      ansible.builtin.shell: sysctl -p

@@ -1,0 +1,8 @@
+{
+  "auths": {
+    "https://index.docker.io/v1/": {
+      "auth": "{{ lookup('env', 'DOCKER_USERNAME') }}:{{ lookup('env', 'DOCKER_TOKEN') }}",
+      "email": "{{ lookup('env', 'DOCKER_EMAIL') }}"
+    }
+  }
+}

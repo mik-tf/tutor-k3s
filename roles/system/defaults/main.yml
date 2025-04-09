@@ -1,0 +1,6 @@
+# File descriptor limits
+file_descriptor_limit: 65535
+
+# Systemd settings
+k3s_service_name: "k3s"
+k3s_service_file: "/etc/systemd/system/k3s.service"
