@@ -1,0 +1,92 @@
+---
+# Setup role - replaces setup.sh
+
+- name: Check if k3s.yaml exists in tfgrid-k3s directory
+  stat:
+    path: "{{ tfgrid_dir }}/k3s.yaml"
+  register: k3s_yaml
+
+- name: Fail if k3s.yaml not found
+  fail:
+    msg: "Error: k3s.yaml not found in {{ tfgrid_dir }}. Please make sure you have deployed a K3s cluster using tfgrid-k3s first."
+  when: not k3s_yaml.stat.exists
+
+- name: Set KUBECONFIG environment variable
+  ansible.builtin.set_fact:
+    kubeconfig: "{{ tfgrid_dir }}/k3s.yaml"
+
+- name: Export KUBECONFIG for current shell session
+  ansible.builtin.shell: export KUBECONFIG="{{ kubeconfig }}"
+  args:
+    executable: /bin/bash
+
+- name: Test kubectl connection
+  ansible.builtin.command: kubectl cluster-info
+  register: kubectl_result
+  ignore_errors: true
+
+- name: Display cluster info
+  debug:
+    msg: "{{ kubectl_result.stdout_lines }}"
+  when: kubectl_result.rc == 0
+
+- name: Fail if kubectl connection failed
+  fail:
+    msg: "Failed to connect to Kubernetes cluster. Please check your cluster status and credentials."
+  when: kubectl_result.rc != 0
+
+- name: Get nodes in the cluster
+  ansible.builtin.command: kubectl get nodes -o wide
+  register: nodes_result
+  when: kubectl_result.rc == 0
+
+- name: Display nodes in the cluster
+  debug:
+    msg: "{{ nodes_result.stdout_lines }}"
+  when: kubectl_result.rc == 0
+
+- name: Create Python virtual environment directory if it doesn't exist
+  ansible.builtin.file:
+    path: "{{ venv_dir }}"
+    state: directory
+
+- name: Set up Python virtual environment
+  ansible.builtin.pip:
+    name: virtualenv
+    state: present
+  become: yes
+
+- name: Create Python virtual environment
+  ansible.builtin.command: python3 -m venv "{{ venv_dir }}"
+  args:
+    creates: "{{ venv_dir }}/bin/activate"
+
+- name: Install/upgrade pip in virtual environment
+  ansible.builtin.pip:
+    name: pip
+    state: latest
+    virtualenv: "{{ venv_dir }}"
+
+- name: Install tutor in virtual environment
+  ansible.builtin.pip:
+    name: tutor
+    state: present
+    virtualenv: "{{ venv_dir }}"
+
+- name: Install kubernetes Python library in virtual environment
+  ansible.builtin.pip:
+    name: kubernetes
+    state: present
+    virtualenv: "{{ venv_dir }}"
+
+- name: Create fish activation script
+  ansible.builtin.template:
+    src: activate.fish.j2
+    dest: "{{ project_dir }}/activate.fish"
+    mode: '0755'
+
+- name: Create bash activation script
+  ansible.builtin.template:
+    src: activate.sh.j2
+    dest: "{{ project_dir }}/activate.sh"
+    mode: '0755'

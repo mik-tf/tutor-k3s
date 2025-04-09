@@ -1,0 +1,90 @@
+---
+# Reset role - replaces reset-openedx.sh
+
+- name: Check if kubectl is available
+  ansible.builtin.command: which kubectl
+  register: kubectl_check
+  ignore_errors: true
+  changed_when: false
+
+- name: Fail if kubectl is not installed
+  fail:
+    msg: "Error: kubectl is not installed or not in PATH"
+  when: kubectl_check.rc != 0
+
+- name: Check if tutor is available
+  ansible.builtin.command: "{{ venv_dir }}/bin/tutor --version"
+  register: tutor_check
+  ignore_errors: true
+  changed_when: false
+
+- name: Fail if tutor is not installed
+  fail:
+    msg: "Error: tutor is not installed or not in PATH. Please make sure you've run the setup role first."
+  when: tutor_check.rc != 0
+
+- name: Ensure KUBECONFIG is set
+  ansible.builtin.set_fact:
+    kubeconfig: "{{ tfgrid_dir }}/k3s.yaml"
+
+- name: Display warning message
+  debug:
+    msg: |
+      WARNING: This will reset your Open edX deployment.
+      All application data in the platform will be PERMANENTLY DELETED.
+      This includes user accounts, courses, and all other data.
+
+- name: Confirm reset
+  ansible.builtin.pause:
+    prompt: "Type 'yes' to confirm that you want to reset your Open edX installation"
+  register: reset_confirmation
+
+- name: Proceed with reset only if confirmed
+  block:
+    - name: Delete all resources in the openedx namespace
+      ansible.builtin.command: "{{ venv_dir }}/bin/tutor k8s stop"
+      register: stop_result
+      changed_when: true
+
+    - name: Force delete any remaining resources in the openedx namespace
+      ansible.builtin.shell: |
+        # Delete everything in the namespace
+        kubectl delete all --all -n {{ openedx_namespace }}
+        
+        # Delete PVCs
+        kubectl delete pvc --all -n {{ openedx_namespace }}
+        
+        # Delete secrets
+        kubectl delete secrets --all -n {{ openedx_namespace }}
+        
+        # Delete configmaps
+        kubectl delete configmaps --all -n {{ openedx_namespace }}
+        
+        # Force delete any stuck pods
+        STUCK_PODS=$(kubectl get pods -n {{ openedx_namespace }} | grep Terminating | awk '{print $1}')
+        if [ ! -z "$STUCK_PODS" ]; then
+          for pod in $STUCK_PODS; do
+            kubectl delete pod -n {{ openedx_namespace }} $pod --force --grace-period=0
+          done
+        fi
+      args:
+        executable: /bin/bash
+      register: force_delete
+      changed_when: true
+      ignore_errors: true
+
+    - name: Delete tutor configuration
+      ansible.builtin.command: "{{ venv_dir }}/bin/tutor config remove"
+      register: config_remove
+      changed_when: true
+  when: reset_confirmation.user_input | lower == 'yes'
+
+- name: Display completion message
+  debug:
+    msg: "Open edX has been reset. You can now run 'make deploy' to deploy a fresh installation."
+  when: reset_confirmation.user_input | lower == 'yes'
+
+- name: Abort message
+  debug:
+    msg: "Reset aborted. Your Open edX installation has not been modified."
+  when: reset_confirmation.user_input | lower != 'yes'

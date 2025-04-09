@@ -1,0 +1,129 @@
+---
+# Registry role - replaces configure-registry-auth.sh
+
+- name: Check if kubectl is available
+  ansible.builtin.command: which kubectl
+  register: kubectl_check
+  ignore_errors: true
+  changed_when: false
+
+- name: Fail if kubectl is not installed
+  fail:
+    msg: "Error: kubectl is not installed or not in PATH"
+  when: kubectl_check.rc != 0
+
+- name: Create openedx namespace if it doesn't exist
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Namespace
+    name: "{{ openedx_namespace }}"
+    state: present
+    kubeconfig: "{{ kubeconfig }}"
+
+- name: Check Docker Hub credentials
+  ansible.builtin.set_fact:
+    docker_creds_missing: "{{ docker_username == '' or docker_token == '' or docker_email == '' }}"
+
+- name: Prompt for Docker Hub username if missing
+  ansible.builtin.pause:
+    prompt: "Enter your Docker Hub username"
+  register: docker_username_prompt
+  when: docker_username == ''
+
+- name: Set Docker Hub username from prompt
+  ansible.builtin.set_fact:
+    docker_username: "{{ docker_username_prompt.user_input }}"
+  when: docker_username == '' and docker_username_prompt is defined
+
+- name: Prompt for Docker Hub token/password if missing
+  ansible.builtin.pause:
+    prompt: "Enter your Docker Hub token/password"
+    echo: no
+  register: docker_token_prompt
+  when: docker_token == ''
+
+- name: Set Docker Hub token from prompt
+  ansible.builtin.set_fact:
+    docker_token: "{{ docker_token_prompt.user_input }}"
+  when: docker_token == '' and docker_token_prompt is defined
+
+- name: Prompt for Docker Hub email if missing
+  ansible.builtin.pause:
+    prompt: "Enter your email address"
+  register: docker_email_prompt
+  when: docker_email == ''
+
+- name: Set Docker Hub email from prompt
+  ansible.builtin.set_fact:
+    docker_email: "{{ docker_email_prompt.user_input }}"
+  when: docker_email == '' and docker_email_prompt is defined
+
+- name: Create Docker Hub credentials secret
+  kubernetes.core.k8s:
+    state: present
+    kubeconfig: "{{ kubeconfig }}"
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: dockerhub-creds
+        namespace: "{{ openedx_namespace }}"
+      type: kubernetes.io/dockerconfigjson
+      data:
+        .dockerconfigjson: >
+          {{
+            {
+              "auths": {
+                "docker.io": {
+                  "auth": (docker_username + ':' + docker_token) | b64encode
+                }
+              }
+            } | to_json | b64encode
+          }}
+
+- name: Configure default service account to use the credentials
+  kubernetes.core.k8s_json_patch:
+    kind: ServiceAccount
+    name: default
+    namespace: "{{ openedx_namespace }}"
+    kubeconfig: "{{ kubeconfig }}"
+    patch:
+      - op: add
+        path: /imagePullSecrets
+        value:
+          - name: dockerhub-creds
+  register: patch_default_sa
+
+- name: Get list of service accounts to patch
+  ansible.builtin.set_fact:
+    service_accounts_to_patch: ["cms", "lms", "mfe"]
+
+- name: Check if service accounts exist
+  kubernetes.core.k8s_info:
+    kind: ServiceAccount
+    name: "{{ item }}"
+    namespace: "{{ openedx_namespace }}"
+    kubeconfig: "{{ kubeconfig }}"
+  register: sa_check
+  with_items: "{{ service_accounts_to_patch }}"
+  ignore_errors: true
+
+- name: Create list of service accounts that exist
+  ansible.builtin.set_fact:
+    existing_service_accounts: "{{ sa_check.results | selectattr('resources', 'defined') | 
+                               selectattr('resources.0', 'defined') | 
+                               map(attribute='item') | list }}"
+
+- name: Configure tutor-related service accounts to use the credentials
+  kubernetes.core.k8s_json_patch:
+    kind: ServiceAccount
+    name: "{{ item }}"
+    namespace: "{{ openedx_namespace }}"
+    kubeconfig: "{{ kubeconfig }}"
+    patch:
+      - op: add
+        path: /imagePullSecrets
+        value:
+          - name: dockerhub-creds
+  with_items: "{{ existing_service_accounts }}"
+  register: patch_sa

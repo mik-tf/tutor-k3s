@@ -1,0 +1,16 @@
+---
+# Reset playbook - runs the reset role
+
+- name: Reset Open edX on K3s
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  become: no
+  
+  tasks:
+    - name: Include common variables
+      include_vars: ../group_vars/all.yml
+      
+    - name: Run reset role
+      include_role:
+        name: reset

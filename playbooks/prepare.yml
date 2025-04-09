@@ -1,0 +1,20 @@
+---
+# Prepare playbook - runs the prepare role
+
+- name: Prepare Kubernetes for Tutor
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  become: no
+  
+  tasks:
+    - name: Include common variables
+      include_vars: ../group_vars/all.yml
+    
+    - name: Set Python interpreter
+      set_fact:
+        ansible_python_interpreter: "{{ venv_dir }}/bin/python3"
+      
+    - name: Run prepare role
+      include_role:
+        name: prepare

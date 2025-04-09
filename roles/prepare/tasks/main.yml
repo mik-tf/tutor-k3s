@@ -1,0 +1,149 @@
+---
+# Prepare role - replaces prepare-k8s.sh
+
+- name: Check if kubectl is available
+  ansible.builtin.command: which kubectl
+  register: kubectl_check
+  ignore_errors: true
+  changed_when: false
+
+- name: Fail if kubectl is not installed
+  fail:
+    msg: "Error: kubectl is not installed or not in PATH"
+  when: kubectl_check.rc != 0
+
+- name: Create openedx namespace
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Namespace
+    name: "{{ openedx_namespace }}"
+    state: present
+    kubeconfig: "{{ kubeconfig }}"
+  register: namespace_result
+
+- name: Display namespace creation result
+  debug:
+    msg: "{{ 'Namespace openedx already exists' if namespace_result.changed == false else 'Created namespace openedx' }}"
+
+- name: Install required Tutor plugins
+  ansible.builtin.pip:
+    name: 
+      - tutor-mfe
+      - tutor-indigo
+    state: present
+    virtualenv: "{{ venv_dir }}"
+
+- name: Check file descriptor limits
+  ansible.builtin.shell: ulimit -n
+  register: current_limit
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Display current file descriptor limit
+  debug:
+    msg: "Current file descriptor limit: {{ current_limit.stdout }}"
+
+- name: Try to increase file descriptor limit for current session
+  ansible.builtin.shell: ulimit -n {{ min_file_descriptors }} 2>/dev/null || echo "Cannot increase limit"
+  register: increase_limit
+  args:
+    executable: /bin/bash
+  when: current_limit.stdout | int < min_file_descriptors | int
+  ignore_errors: true
+  changed_when: false
+
+- name: Check if limit was increased
+  ansible.builtin.shell: ulimit -n
+  register: new_limit
+  args:
+    executable: /bin/bash
+  when: current_limit.stdout | int < min_file_descriptors | int
+  changed_when: false
+
+- name: Display new file descriptor limit
+  debug:
+    msg: "Successfully increased file descriptor limit to {{ new_limit.stdout }} for this session"
+  when: current_limit.stdout | int < min_file_descriptors | int and new_limit.stdout | int > current_limit.stdout | int
+
+- name: Create file descriptor limits file
+  ansible.builtin.copy:
+    dest: /tmp/openedx-limits.conf
+    content: |
+      # Increase file descriptor limits for OpenEdX
+      * soft nofile {{ min_file_descriptors }}
+      * hard nofile {{ min_file_descriptors }}
+      root soft nofile {{ min_file_descriptors }}
+      root hard nofile {{ min_file_descriptors }}
+  when: current_limit.stdout | int < min_file_descriptors | int and new_limit.stdout | int <= current_limit.stdout | int
+  register: limits_file
+
+- name: Copy file descriptor limits to system location
+  ansible.builtin.command: sudo cp /tmp/openedx-limits.conf /etc/security/limits.d/99-openedx-limits.conf
+  when: limits_file is changed
+  ignore_errors: true
+  register: copy_limits
+  changed_when: copy_limits.rc == 0
+
+- name: Display warning if file descriptor limits could not be increased
+  debug:
+    msg: |
+      Warning: File descriptor limits are too low for OpenEdX.
+      You should manually increase the limits by adding the following to /etc/security/limits.conf:
+      * soft nofile {{ min_file_descriptors }}
+      * hard nofile {{ min_file_descriptors }}
+      Then log out and log back in, or restart your K3s service.
+  when: current_limit.stdout | int < min_file_descriptors | int and (new_limit.stdout | int <= current_limit.stdout | int) and (copy_limits is defined and copy_limits.rc != 0)
+
+- name: Check storage classes
+  kubernetes.core.k8s_info:
+    kind: StorageClass
+    kubeconfig: "{{ kubeconfig }}"
+  register: storage_classes
+
+- name: Create local-path storage provisioner
+  kubernetes.core.k8s:
+    src: https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
+    state: present
+    kubeconfig: "{{ kubeconfig }}"
+  when: storage_classes.resources | length == 0
+  register: local_path_result
+
+- name: Set local-path as the default storage class
+  kubernetes.core.k8s_json_patch:
+    kind: StorageClass
+    name: local-path
+    kubeconfig: "{{ kubeconfig }}"
+    patch:
+      - op: add
+        path: /metadata/annotations/storageclass.kubernetes.io~1is-default-class
+        value: "true"
+  when: local_path_result is defined and local_path_result.changed
+  register: default_sc_result
+
+- name: Display storage class setup results
+  debug:
+    msg: "Local-path storage provisioner installed and set as default"
+  when: default_sc_result is defined and default_sc_result.changed
+
+- name: Check for NGINX ingress controller
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: kube-system
+    label_selectors:
+      - app=ingress-nginx
+    kubeconfig: "{{ kubeconfig }}"
+  register: ingress_pods
+
+- name: Install NGINX ingress controller if not found
+  kubernetes.core.k8s:
+    src: https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.2/deploy/static/provider/cloud/deploy.yaml
+    state: present
+    kubeconfig: "{{ kubeconfig }}"
+  when: ingress_pods.resources | length == 0
+  register: ingress_result
+
+- name: Display ingress controller setup results
+  debug:
+    msg: "NGINX ingress controller installed"
+  when: ingress_result is defined and ingress_result.changed

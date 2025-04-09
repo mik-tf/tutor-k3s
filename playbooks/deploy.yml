@@ -1,0 +1,20 @@
+---
+# Deploy playbook - runs the deploy role
+
+- name: Deploy Open edX on K3s
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  become: no
+  
+  tasks:
+    - name: Include common variables
+      include_vars: ../group_vars/all.yml
+    
+    - name: Set Python interpreter
+      set_fact:
+        ansible_python_interpreter: "{{ venv_dir }}/bin/python3"
+      
+    - name: Run deploy role
+      include_role:
+        name: deploy

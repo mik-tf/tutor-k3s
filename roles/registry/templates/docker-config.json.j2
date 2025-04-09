@@ -1,0 +1,7 @@
+{
+  "auths": {
+    "docker.io": {
+      "auth": "{{ (docker_username + ':' + docker_token) | b64encode }}"
+    }
+  }
+}

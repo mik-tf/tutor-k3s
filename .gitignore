@@ -1,69 +1,60 @@
-# Python virtual environment
-venv/
-env/
-ENV/
-.env/
-.venv/
-*.pyc
+# Ansible specific
+*.retry
+.ansible/
+.ansible-lint
+.ansible/roles/
+.ansible/tmp/
+
+# Python specific
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
 .Python
-
-# Tutor specific
-.tutor/
-tutor_env/
-tutor-env/
-tutor.env
-tutor_data/
-data/
-
-# Kubernetes
-k3s.yaml
-kubeconfig.yaml
-*.kubeconfig
-.kube/
-
-# IDE and editor files
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# Logs
-*.log
-logs/
-
-# Distribution / packaging
-dist/
 build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
 *.egg-info/
-
-# Local configuration
-.local/
-local_settings.py
-
-# Temporary files
-tmp/
-temp/
-
-# Certificates and sensitive data
-*.pem
-*.key
-*.crt
-*.cert
-*.p12
-*.pfx
-*.ca-bundle
-*.cer
-*.der
-*.priv
+.installed.cfg
+*.egg
 
 # Environment variables
 .env
 .env.local
-.env.development
-.env.test
-.env.production
+
+# IDE specific
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Cache files
+.cache/
+*.cache
+
+# Local development files
+local.*
+
+# Temporary files
+*~
+#*#
+
+# Sensitive files
+vault-password.txt
+vault-password-file
+
+# K3s specific
+k3s.yaml

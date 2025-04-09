@@ -1,0 +1,268 @@
+---
+# Deploy role - replaces deploy-openedx.sh
+
+- name: Check if kubectl is available
+  ansible.builtin.command: which kubectl
+  register: kubectl_check
+  ignore_errors: true
+  changed_when: false
+
+- name: Fail if kubectl is not installed
+  fail:
+    msg: "Error: kubectl is not installed or not in PATH"
+  when: kubectl_check.rc != 0
+
+- name: Check if tutor is available
+  ansible.builtin.command: "{{ venv_dir }}/bin/tutor --version"
+  register: tutor_check
+  ignore_errors: true
+  changed_when: false
+
+- name: Fail if tutor is not installed
+  fail:
+    msg: "Error: tutor is not installed or not in PATH. Please make sure you've run the setup role first."
+  when: tutor_check.rc != 0
+
+- name: Ensure KUBECONFIG is set
+  ansible.builtin.set_fact:
+    kubeconfig: "{{ tfgrid_dir }}/k3s.yaml"
+
+- name: Check if KUBECONFIG file exists
+  ansible.builtin.stat:
+    path: "{{ kubeconfig }}"
+  register: kubeconfig_file
+
+- name: Fail if KUBECONFIG file doesn't exist
+  fail:
+    msg: "Error: KUBECONFIG file doesn't exist: {{ kubeconfig }}. Please make sure you've deployed a K3s cluster with tfgrid-k3s first."
+  when: not kubeconfig_file.stat.exists
+
+- name: Check file descriptor limits
+  ansible.builtin.shell: ulimit -n
+  register: current_limit
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Display current file descriptor limit
+  debug:
+    msg: "Current file descriptor limit: {{ current_limit.stdout }}"
+
+- name: Try to increase file descriptor limit for current session
+  ansible.builtin.shell: ulimit -n {{ min_file_descriptors }} 2>/dev/null || echo "Cannot increase limit"
+  register: increase_limit
+  args:
+    executable: /bin/bash
+  when: current_limit.stdout | int < min_file_descriptors | int
+  ignore_errors: true
+  changed_when: false
+
+- name: Check if limit was increased
+  ansible.builtin.shell: ulimit -n
+  register: new_limit
+  args:
+    executable: /bin/bash
+  when: current_limit.stdout | int < min_file_descriptors | int
+  changed_when: false
+
+- name: Display warning if file descriptor limits are too low
+  debug:
+    msg: |
+      Warning: File descriptor limit is too low ({{ current_limit.stdout }}).
+      OpenEdX container images require higher limits to prevent 'too many open files' errors.
+      You may encounter 'ImagePullBackOff' errors with 'too many open files' messages.
+      To fix this permanently, run the prepare role or manually increase system limits.
+  when: current_limit.stdout | int < min_file_descriptors | int and new_limit.stdout | int <= current_limit.stdout | int
+
+- name: Clean up any existing failed deployment
+  kubernetes.core.k8s:
+    kind: "{{ item.kind }}"
+    namespace: "{{ openedx_namespace }}"
+    state: absent
+    kubeconfig: "{{ kubeconfig }}"
+  loop:
+    - { kind: "Job" }
+    - { kind: "ConfigMap" }
+  register: cleanup_result
+  ignore_errors: true
+
+- name: Create openedx namespace if it doesn't exist
+  kubernetes.core.k8s:
+    api_version: v1
+    kind: Namespace
+    name: "{{ openedx_namespace }}"
+    state: present
+    kubeconfig: "{{ kubeconfig }}"
+
+- name: Check if indigo plugin is enabled
+  ansible.builtin.command: "{{ venv_dir }}/bin/tutor plugins list"
+  register: plugins_list
+  changed_when: false
+
+- name: Install and enable indigo plugin if needed
+  block:
+    - name: Install tutor-indigo
+      ansible.builtin.pip:
+        name: tutor-indigo
+        state: present
+        virtualenv: "{{ venv_dir }}"
+      
+    - name: Enable indigo plugin
+      ansible.builtin.command: "{{ venv_dir }}/bin/tutor plugins enable indigo"
+      changed_when: true
+  when: "'indigo.*enabled' not in plugins_list.stdout"
+
+- name: Install and enable mfe plugin if needed
+  block:
+    - name: Install tutor-mfe
+      ansible.builtin.pip:
+        name: tutor-mfe
+        state: present
+        virtualenv: "{{ venv_dir }}"
+      
+    - name: Enable mfe plugin
+      ansible.builtin.command: "{{ venv_dir }}/bin/tutor plugins enable mfe"
+      changed_when: true
+  when: "'mfe.*enabled' not in plugins_list.stdout"
+
+- name: Check if Docker registry authentication is configured
+  kubernetes.core.k8s_info:
+    kind: Secret
+    name: dockerhub-creds
+    namespace: "{{ openedx_namespace }}"
+    kubeconfig: "{{ kubeconfig }}"
+  register: registry_auth
+
+- name: Configure Docker registry authentication if needed
+  include_role:
+    name: registry
+  when: registry_auth.resources | length == 0
+
+- name: Configure Tutor with proper hostnames
+  ansible.builtin.command: "{{ venv_dir }}/bin/tutor config save --set {{ item.key }}={{ item.value }}"
+  loop:
+    - { key: "LMS_HOST", value: "{{ lms_host }}" }
+    - { key: "CMS_HOST", value: "{{ cms_host }}" }
+  changed_when: true
+
+- name: Save Tutor configuration
+  ansible.builtin.command: "{{ venv_dir }}/bin/tutor config save"
+  changed_when: true
+
+- name: Deploy Open edX on Kubernetes
+  ansible.builtin.command: "{{ venv_dir }}/bin/tutor k8s start"
+  register: deploy_result
+  changed_when: true
+
+- name: Wait for pods to be ready
+  block:
+    - name: Set retry count
+      ansible.builtin.set_fact:
+        retry_count: 0
+        all_ready: false
+        
+    - name: Check pod status with retry
+      ansible.builtin.shell: |
+        # Get pod status
+        kubectl get pods -n {{ openedx_namespace }}
+        
+        # Check for ImagePullBackOff issues
+        IMAGE_PULL_ISSUES=$(kubectl get pods -n {{ openedx_namespace }} -o json | jq -r '.items[] | select(.status.phase != "Running" and .status.containerStatuses[0].state.waiting.reason == "ImagePullBackOff") | .metadata.name')
+        
+        if [ ! -z "$IMAGE_PULL_ISSUES" ]; then
+          echo "Detected ImagePullBackOff issues. Attempting to fix..."
+          for pod in $IMAGE_PULL_ISSUES; do
+            echo "Deleting pod $pod to trigger a retry..."
+            kubectl delete pod -n {{ openedx_namespace }} $pod
+          done
+          echo "Waiting 30 seconds for new pods to be created..."
+          sleep 30
+        fi
+        
+        # Check for stuck Terminating pods
+        STUCK_PODS=$(kubectl get pods -n {{ openedx_namespace }} | grep Terminating | awk '{print $1}')
+        if [ ! -z "$STUCK_PODS" ]; then
+          echo "Detected pods stuck in Terminating state. Force deleting them..."
+          for pod in $STUCK_PODS; do
+            echo "Force deleting pod: $pod"
+            kubectl delete pod -n {{ openedx_namespace }} $pod --force --grace-period=0
+          done
+          echo "Waiting 10 seconds for cleanup..."
+          sleep 10
+        fi
+        
+        # Check if all pods are ready
+        NOT_READY=$(kubectl get pods -n {{ openedx_namespace }} -o json | jq -r '.items[] | select(.status.phase != "Running" and .status.phase != "ContainerCreating" or ([ .status.containerStatuses[] | select(.ready == false) ] | length > 0)) | .metadata.name')
+        
+        # Count pods in ContainerCreating state
+        CONTAINER_CREATING=$(kubectl get pods -n {{ openedx_namespace }} -o json | jq -r '.items[] | select(.status.phase == "ContainerCreating") | .metadata.name' | wc -l)
+        
+        if [ -z "$NOT_READY" ]; then
+          echo "all_ready=true"
+          echo "container_creating=0"
+          exit 0
+        else
+          echo "all_ready=false"
+          echo "container_creating=$CONTAINER_CREATING"
+          exit 1
+        fi
+      register: pod_status
+      retries: 30
+      delay: 30
+      until: pod_status.stdout_lines[-1] == "all_ready=true" or pod_status.stdout_lines[-2] == "container_creating=0"
+      
+    - name: Display pod status
+      debug:
+        msg: "Pod status: {{ pod_status.stdout }}"
+      when: pod_status is defined
+
+    - name: Check for persistent ImagePullBackOff issues
+      ansible.builtin.shell: |
+        kubectl get pods -n {{ openedx_namespace }} -o json | jq -r '.items[] | select(.status.phase != "Running" and .status.containerStatuses[0].state.waiting.reason == "ImagePullBackOff") | .metadata.name'
+      register: persistent_image_issues
+      
+    - name: Display warning if there are persistent image pull issues
+      debug:
+        msg: |
+          Warning: Some pods are stuck in ImagePullBackOff state:
+          {{ persistent_image_issues.stdout }}
+          This might be due to:
+          1. Docker Hub rate limits
+          2. Network connectivity issues
+          3. Insufficient file descriptor limits
+          
+          You can try:
+          1. Running 'make registry-auth' to reconfigure Docker registry authentication
+          2. Increasing file descriptor limits (see README for instructions)
+          3. Using a Docker Hub account with higher rate limits
+      when: persistent_image_issues.stdout != ""
+
+    - name: Initialize Open edX
+      ansible.builtin.command: "{{ venv_dir }}/bin/tutor k8s start"
+      when: pod_status.stdout_lines[-1] == "all_ready=true"
+      changed_when: true
+
+- name: Initialize Open edX
+  ansible.builtin.command: "{{ venv_dir }}/bin/tutor k8s init"
+  ignore_errors: true
+  changed_when: true
+
+- name: Display deployment information
+  debug:
+    msg: |
+      To access your Open edX instance, you need to add the following entries to your /etc/hosts file:
+      127.0.0.1 {{ lms_host }} {{ cms_host }}
+      
+      To create a superuser account, run:
+      {{ venv_dir }}/bin/tutor k8s exec lms -- python manage.py lms createsuperuser
+      
+      To check the status of your deployment:
+      {{ venv_dir }}/bin/tutor k8s status
+      
+      To port-forward the LMS service to access it locally:
+      kubectl port-forward -n {{ openedx_namespace }} svc/lms 8000:8000
+      Then access: http://{{ lms_host }}:8000
+      
+      To port-forward the Studio service to access it locally:
+      kubectl port-forward -n {{ openedx_namespace }} svc/cms 8001:8000
+      Then access: http://{{ cms_host }}:8001

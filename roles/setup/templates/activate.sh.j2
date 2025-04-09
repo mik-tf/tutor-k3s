@@ -1,0 +1,12 @@
+#!/bin/bash
+# Activate the tutor-k3s-ansible environment
+
+# Set KUBECONFIG
+export KUBECONFIG="{{ tfgrid_dir }}/k3s.yaml"
+
+# Activate Python virtual environment
+source "{{ venv_dir }}/bin/activate"
+
+echo "Tutor K3s environment activated."
+echo "KUBECONFIG set to: ${KUBECONFIG}"
+echo "Python virtual environment activated."

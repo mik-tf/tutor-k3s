@@ -1,0 +1,102 @@
+---
+# Cleanup role - replaces cleanup-stuck-pods.sh
+
+- name: Check if kubectl is available
+  ansible.builtin.command: which kubectl
+  register: kubectl_check
+  ignore_errors: true
+  changed_when: false
+
+- name: Fail if kubectl is not installed
+  fail:
+    msg: "Error: kubectl is not installed or not in PATH"
+  when: kubectl_check.rc != 0
+
+- name: List pods in the openedx namespace
+  ansible.builtin.command: kubectl get pods -n {{ openedx_namespace }}
+  register: pods_list
+  changed_when: false
+
+- name: Display current pods
+  debug:
+    msg: "{{ pods_list.stdout_lines }}"
+
+- name: Find stuck pods in Terminating state
+  ansible.builtin.shell: |
+    kubectl get pods -n {{ openedx_namespace }} | grep Terminating | awk '{print $1}'
+  register: stuck_pods
+  changed_when: false
+
+- name: Force delete stuck Terminating pods
+  ansible.builtin.command: kubectl delete pod -n {{ openedx_namespace }} {{ item }} --force --grace-period=0
+  with_items: "{{ stuck_pods.stdout_lines }}"
+  when: stuck_pods.stdout_lines | length > 0
+  register: delete_result
+
+- name: Display force delete results
+  debug:
+    msg: "Deleted stuck pods: {{ delete_result.results | map(attribute='item') | list | join(', ') }}"
+  when: stuck_pods.stdout_lines | length > 0
+
+- name: Find pods with ImagePullBackOff issues
+  ansible.builtin.shell: |
+    kubectl get pods -n {{ openedx_namespace }} -o json | 
+    jq -r '.items[] | select(.status.phase != "Running" and .status.containerStatuses[0].state.waiting.reason == "ImagePullBackOff") | .metadata.name'
+  register: image_pull_issues
+  changed_when: false
+
+- name: Delete pods with ImagePullBackOff issues
+  ansible.builtin.command: kubectl delete pod -n {{ openedx_namespace }} {{ item }}
+  with_items: "{{ image_pull_issues.stdout_lines }}"
+  when: image_pull_issues.stdout_lines | length > 0
+  register: pull_delete_result
+
+- name: Display ImagePullBackOff delete results
+  debug:
+    msg: "Deleted pods with ImagePullBackOff issues: {{ pull_delete_result.results | map(attribute='item') | list | join(', ') }}"
+  when: image_pull_issues.stdout_lines | length > 0
+
+- name: Find pods with CrashLoopBackOff issues
+  ansible.builtin.shell: |
+    kubectl get pods -n {{ openedx_namespace }} -o json | 
+    jq -r '.items[] | select(.status.phase != "Running" and .status.containerStatuses[0].state.waiting.reason == "CrashLoopBackOff") | .metadata.name'
+  register: crash_loop_issues
+  changed_when: false
+
+- name: Delete pods with CrashLoopBackOff issues
+  ansible.builtin.command: kubectl delete pod -n {{ openedx_namespace }} {{ item }}
+  with_items: "{{ crash_loop_issues.stdout_lines }}"
+  when: crash_loop_issues.stdout_lines | length > 0
+  register: crash_delete_result
+
+- name: Display CrashLoopBackOff delete results
+  debug:
+    msg: "Deleted pods with CrashLoopBackOff issues: {{ crash_delete_result.results | map(attribute='item') | list | join(', ') }}"
+  when: crash_loop_issues.stdout_lines | length > 0
+
+- name: Check if any pods were deleted
+  ansible.builtin.set_fact:
+    pods_deleted: "{{ (stuck_pods.stdout_lines | length > 0) or 
+                     (image_pull_issues.stdout_lines | length > 0) or 
+                     (crash_loop_issues.stdout_lines | length > 0) }}"
+
+- name: Wait a moment for new pods to be created
+  ansible.builtin.pause:
+    seconds: 10
+  when: pods_deleted | bool
+
+- name: Get updated pod status
+  ansible.builtin.command: kubectl get pods -n {{ openedx_namespace }}
+  register: updated_pods
+  changed_when: false
+  when: pods_deleted | bool
+
+- name: Display updated pod status
+  debug:
+    msg: "{{ updated_pods.stdout_lines }}"
+  when: pods_deleted | bool
+
+- name: No stuck pods found
+  debug:
+    msg: "No stuck pods found in the openedx namespace."
+  when: not pods_deleted | bool

@@ -1,136 +1,190 @@
-# Tutor for K3s Kubernetes Management
+# Tutor for K3s Kubernetes Management - Ansible Edition
 
-This repository contains scripts to set up and run [Tutor](https://docs.tutor.overhang.io/) with a K3s Kubernetes cluster deployed using the [tfgrid-k3s](https://github.com/mik-tf/tfgrid-k3s) project in the same main directory.
+This repository contains Ansible playbooks and roles to set up and run [Tutor](https://docs.tutor.overhang.io/) with a K3s Kubernetes cluster deployed using the [tfgrid-k3s](https://github.com/mik-tf/tfgrid-k3s) project in the same main directory.
 
 ## Project Tree
 
 ```
 .
 ├── tfgrid-k3s
-└── tutor-k3s
+└── tutor-k3s-ansible
 ```
 
 ## Overview
 
-Tutor is the official Docker-based Open edX distribution. This setup allows you to deploy Open edX on a K3s Kubernetes cluster running on ThreeFold Grid.
+Tutor is the official Docker-based Open edX distribution. This setup allows you to deploy Open edX on a K3s Kubernetes cluster running on ThreeFold Grid, using Ansible for automation and configuration management instead of Bash scripts.
 
 ## Prerequisites
 
 - A running K3s cluster deployed with the tfgrid-k3s project
 - Python 3.6+ installed on your local machine
 - kubectl installed on your local machine
+- Ansible 2.9+ installed on your local machine
 
-## Setup
+## Installation and Setup
 
-1. Make sure you have a running K3s cluster deployed with tfgrid-k3s
-2. Run the setup script to configure the environment:
+### 1. Deploy K3s Cluster First
 
-```bash
-make setup
-```
-
-This will:
-- Set up KUBECONFIG to point to your tfgrid-k3s cluster's k3s.yaml file
-- Create a Python virtual environment
-- Install tutor via pip
-
-3. Prepare your Kubernetes cluster for Tutor:
+Before you can deploy Tutor, you must first have a running K3s cluster:
 
 ```bash
-make prepare
+# Clone the tfgrid-k3s repository if you haven't already
+git clone https://github.com/mik-tf/tfgrid-k3s
+cd tfgrid-k3s
+
+# Deploy the K3s cluster following instructions in tfgrid-k3s README
+make
 ```
 
-This will:
-- Create the necessary 'openedx' namespace
-- Install required Tutor plugins (mfe, indigo)
-- Set up storage classes if needed
-- Install an ingress controller if not present
+### 2. Clone and Set Up Tutor-K3s-Ansible
 
-## Usage
-
-### Activating the Environment
-
-After initial setup, you can activate the environment in future sessions.
-
-For fish shell (recommended):
-
-```fish
-source activate.fish
-```
-
-For bash shell:
+After your K3s cluster is up and running:
 
 ```bash
-source activate.sh
+# Navigate back to the parent directory (where tfgrid-k3s is located)
+cd ..
+
+# Clone the tutor-k3s-ansible repository next to tfgrid-k3s
+git clone https://github.com/mik-tf/tutor-k3s
+cd tutor-k3s
 ```
 
-This will:
-- Set KUBECONFIG to point to the k3s.yaml in the tfgrid-k3s directory
-- Activate the Python virtual environment with tutor installed
-
-### Configuring Docker Registry Authentication
-
-To avoid Docker Hub rate limits and authentication issues when pulling images, you should configure registry authentication before deploying Open edX. This is especially important for production environments.
-
-The recommended approach is to use a Docker Hub access token instead of your password:
-
-1. Create a Docker Hub access token at https://hub.docker.com/settings/security
-   - Set the token description (e.g., "K3s OpenEdX Deployment")
-   - Set access permissions to **Read-only** (minimum required)
-     - For public repositories, you can use **Public repo read-only**
-   - Set an appropriate expiration based on your security policies
-2. Set the following environment variables (securely):
+### 3. Set Configuration and Environment Variables
 
 ```bash
-# For secure credential handling, use:
-set +o history  # Disable command history
+# Docker Hub credentials (optional but recommended to avoid rate limits)
+set +o history  # Disable command history for security
 export DOCKER_USERNAME="your_dockerhub_username"
 export DOCKER_TOKEN="your_dockerhub_token"
 export DOCKER_EMAIL="your_email"
 set -o history  # Re-enable command history
 ```
 
-3. Run the registry authentication setup:
+### 4. Run Setup and Deploy
 
 ```bash
+# Initialize the environment and verify connection to K3s cluster
+make setup
+
+# Prepare the Kubernetes cluster for Tutor
+make prepare
+
+# Configure Docker registry authentication (if you set credentials above)
 make registry-auth
-```
 
-This will create a Kubernetes secret with your Docker Hub credentials and configure all necessary service accounts to use it for pulling images.
-
-> **Note**: The `make deploy` command automatically includes the registry authentication step, so you don't need to run it separately unless you want to update your credentials.
-
-### Deploying Open edX
-
-The deployment process has been automated with a comprehensive script. After activating the environment, simply run:
-
-```bash
+# Deploy Open edX
 make deploy
 ```
 
-This will:
-1. Clean up any existing failed deployment
-2. Create the openedx namespace if it doesn't exist
-3. Install and enable required Tutor plugins (indigo, mfe)
-4. Configure Tutor with proper hostnames (lms.local, studio.local)
-5. Save the configuration
-6. Deploy Open edX on Kubernetes
-7. Wait for pods to be ready
-8. Initialize Open edX
-9. Provide access information
+Each step performs the following functions:
+
+**make setup**:
+- Sets up KUBECONFIG to point to your tfgrid-k3s cluster's k3s.yaml file
+- Creates a Python virtual environment
+- Installs tutor via pip
+- Tests connectivity to your K3s cluster
+
+**make prepare**:
+- Creates the necessary 'openedx' namespace
+- Installs required Tutor plugins (mfe, indigo)
+- Sets up storage classes if needed
+- Installs an ingress controller if not present
+
+**make registry-auth**:
+- Creates Docker registry credentials for pulling Open edX images
+- Configures Kubernetes service accounts to use these credentials
+
+**make deploy**:
+- Cleans up any existing failed deployment
+- Configures the Open edX platform
+- Deploys all Open edX services to Kubernetes
+- Waits for all pods to be ready
+
+## Configuration
+
+### Default Configuration
+By default, the deployment will use local settings:
+- LMS (Learning Management System): http://lms.local:8000
+- Studio (Content Management System): http://studio.local:8001
+
+### Customizing Configuration
+You can customize your Open edX installation by modifying the configuration before deploying:
+
+1. First, activate the environment:
+```bash
+# For fish shell (recommended)
+source activate.fish
+
+# For bash shell
+source activate.sh
+```
+
+2. Then set your custom configuration:
+```bash
+# Set custom domain names
+tutor config save --set LMS_HOST=your-lms-domain.com
+tutor config save --set CMS_HOST=your-studio-domain.com
+
+# Set platform name
+tutor config save --set PLATFORM_NAME="Your Platform Name"
+
+# Configure email settings
+tutor config save --set EMAIL_USE_TLS=true
+tutor config save --set EMAIL_HOST=smtp.your-email-provider.com
+
+tutor config save --set EMAIL_PORT=587
+tutor config save --set EMAIL_USE_SSL=false
+tutor config save --set EMAIL_HOST_USER=your-email@domain.com
+tutor config save --set EMAIL_HOST_PASSWORD=your-email-password
+
+# Configure database settings
+tutor config save --set MYSQL_ROOT_PASSWORD=your-secure-password
+tutor config save --set MYSQL_PASSWORD=your-secure-password
+```
+
+### Common Configuration Options
+Here are some commonly modified settings:
+
+- **Platform Settings**:
+  - `PLATFORM_NAME`: Name of your Open edX platform
+  - `LMS_HOST`: Domain name for the LMS
+  - `CMS_HOST`: Domain name for Studio
+  - `ENABLE_HTTPS`: Enable HTTPS (default: false)
+
+- **Email Settings**:
+  - `EMAIL_USE_TLS`: Use TLS for email (default: true)
+  - `EMAIL_HOST`: SMTP server
+  - `EMAIL_PORT`: SMTP port (default: 587)
+  - `EMAIL_HOST_USER`: Email username
+  - `EMAIL_HOST_PASSWORD`: Email password
+
+- **Database Settings**:
+  - `MYSQL_ROOT_PASSWORD`: MySQL root password
+  - `MYSQL_PASSWORD`: MySQL user password
+  - `MYSQL_DATABASE`: Database name (default: edxapp)
+
+- **Security Settings**:
+  - `SECRET_KEY`: Django secret key
+  - `JWT_SECRET_KEY`: JWT secret key
+  - `EDXAPP_LMS_SECRET_KEY`: LMS secret key
+  - `EDXAPP_CMS_SECRET_KEY`: CMS secret key
 
 ### Accessing Your Open edX Instance
 
-After deployment, you'll need to set up local DNS or use port-forwarding to access your Open edX instance:
+After deployment, you'll need to set up access to your Open edX instance:
 
+1. For local development, add entries to your [/etc/hosts](cci:7://file:///etc/hosts:0:0-0:0) file:
 ```bash
-# Add to your /etc/hosts file
+# Add to /etc/hosts
 127.0.0.1 lms.local studio.local
+```
 
-# Port-forward the LMS service
+2. Use port-forwarding to access the services:
+```bash
+# Forward LMS (Learning Management System)
 kubectl port-forward -n openedx svc/lms 8000:8000
 
-# In another terminal, port-forward the Studio service
+# Forward Studio (Content Management System)
 kubectl port-forward -n openedx svc/cms 8001:8000
 ```
 
@@ -139,36 +193,15 @@ Then access:
 - Studio (Content Management System): http://studio.local:8001
 
 ### Creating an Admin User
-
 To create a superuser account for administrative access:
 
 ```bash
 tutor k8s exec lms -- python manage.py lms createsuperuser
 ```
 
-### Customizing Your Open edX Installation
-
-You can customize your Open edX installation by editing the configuration:
-
-```bash
-# Edit configuration values
-tutor config save --set PLATFORM_NAME="Your Platform Name"
-
-# View current configuration
-tutor config printvalue PLATFORM_NAME
-
-# After making changes, redeploy
-make deploy
-```
-
-Refer to the [official Tutor documentation](https://docs.tutor.overhang.io/) for more detailed instructions on using Tutor with Kubernetes.
-
-## Troubleshooting
-
-### Common Issues
+### Troubleshooting
 
 #### ImagePullBackOff
-
 If you see pods stuck in `ImagePullBackOff` status:
 
 ```
@@ -176,7 +209,7 @@ NAME                     READY   STATUS             RESTARTS   AGE
 cms-8697d55fc8-wddfz     0/1     ImagePullBackOff   0          17m
 ```
 
-This means Kubernetes is having trouble pulling the container images. Possible solutions:
+This means Kubernetes is having trouble pulling the container images. Solutions:
 
 1. **Configure Docker Registry Authentication**: The most reliable solution is to set up proper authentication:
    ```bash
@@ -192,7 +225,7 @@ This means Kubernetes is having trouble pulling the container images. Possible s
    - Configure registry mirrors in your K3s setup
 
 4. **File Descriptor Limits**: Open edX images contain thousands of files. If you see errors like `too many open files` in your pod status, your system's file descriptor limits are too low. Solutions:
-   - The `prepare-k8s.sh` script now automatically checks and attempts to increase these limits
+   - The `prepare` target automatically checks and attempts to increase these limits
    - You can manually increase limits by adding to `/etc/security/limits.conf` or `/etc/security/limits.d/99-openedx-limits.conf`:
      ```
      * soft nofile 65535
@@ -200,90 +233,42 @@ This means Kubernetes is having trouble pulling the container images. Possible s
      root soft nofile 65535
      root hard nofile 65535
      ```
-   - After changing limits, log out and back in, or restart your K3s service: `sudo systemctl restart k3s`
 
-5. **Manual Image Pull**: Try manually pulling the image on your nodes
-   ```bash
-   # Find the image name
-   kubectl describe pod -n openedx <pod-name> | grep Image:
-   # Pull the image manually
-   docker pull <image-name>
-   ```
+#### Stuck Pods
 
-5. **Delete and Recreate**: Sometimes deleting the pod will trigger a successful retry
-   ```bash
-   kubectl delete pod -n openedx <pod-name>
-   ```
-
-#### CrashLoopBackOff
-
-If pods are in `CrashLoopBackOff` status, check the logs:
+If you have pods stuck in Terminating or other states, you can run the cleanup target:
 
 ```bash
-kubectl logs -n openedx <pod-name>
+make cleanup
 ```
 
-For Caddy specifically, if you see `ambiguous site definition`, ensure your LMS_HOST and CMS_HOST are set to different values:
+This will force delete stuck pods and clean up resources that might be causing issues.
+
+#### Complete Reset
+
+If you want to completely reset your Open edX deployment:
 
 ```bash
-tutor config save --set LMS_HOST=lms.local
-tutor config save --set CMS_HOST=studio.local
-tutor k8s start
-```
-
-#### ContainerCreating or Pending
-
-Pods stuck in these states might be waiting for:
-
-1. **Resource constraints**: Check if your nodes have enough CPU/memory
-2. **Volume issues**: Check if PersistentVolumeClaims are bound
-3. **Dependent services**: Some pods depend on others (like MySQL) to be running first
-
-Check events for more details:
-
-```bash
-kubectl get events -n openedx --sort-by=.metadata.creationTimestamp
-```
-
-### Resetting Your Deployment
-
-If you need to start completely fresh (this will delete all data):
-
-```bash
-# Complete reset (interactive, will ask for confirmation)
 make reset
-
-# After reset, redeploy
-make deploy
 ```
 
-The reset process will:
-1. Delete all resources in the openedx namespace (pods, services, deployments)
-2. Delete all persistent volume claims (databases, uploaded files)
-3. Delete all configmaps and secrets
-4. Delete the namespace itself
-5. Optionally reset Tutor configuration to defaults
+Refer to the [official Tutor documentation](https://docs.tutor.overhang.io/) for more detailed instructions on using Tutor with Kubernetes.
 
-This is useful when:
-- You want to start from scratch with a clean installation
-- You're experiencing persistent issues that can't be resolved otherwise
-- You're testing the deployment process
+## Ansible Structure
 
-### Additional Troubleshooting Steps
+This project uses Ansible to organize the deployment process:
 
-1. Verify your K3s cluster is running properly:
-   ```bash
-   kubectl get nodes
-   ```
+- `roles/`: Contains all the tasks for different stages of the deployment
+  - `setup/`: Initial environment setup
+  - `prepare/`: Preparing Kubernetes for Tutor
+  - `registry/`: Docker registry authentication
+  - `deploy/`: Deploying Open edX
+  - `cleanup/`: Cleaning up stuck pods
+  - `reset/`: Resetting the deployment
+- `playbooks/`: Individual playbooks for each operation
+- `group_vars/`: Common variables used across playbooks
+- `inventories/`: Host definitions
 
-2. Check the status of your pods:
-   ```bash
-   kubectl get pods -n openedx
-   ```
+## License
 
-3. View logs for a specific pod:
-   ```bash
-   kubectl logs -n openedx <pod-name>
-   ```
-
-4. For more detailed troubleshooting, refer to the [Tutor Kubernetes documentation](https://docs.tutor.overhang.io/k8s.html).
+This project is licensed under the same license as the original tutor-k3s project.
