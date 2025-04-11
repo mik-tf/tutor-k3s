@@ -137,7 +137,7 @@
 
 - name: Install NGINX ingress controller if not found
   kubernetes.core.k8s:
-    src: https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.2/deploy/static/provider/cloud/deploy.yaml
+    src: https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.12.1/deploy/static/provider/cloud/deploy.yaml
     state: present
     kubeconfig: "{{ kubeconfig }}"
   when: ingress_pods.resources | length == 0

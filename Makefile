@@ -13,7 +13,7 @@ copy-k3s-config: ## Copy k3s config to local directory
 	cp ../tfgrid-k3s/k3s.yaml config/k3s.yaml
 
 system: copy-k3s-config ## Run the system role playbook
-	KUBECONFIG=$(CURDIR)/config/k3s.yaml ansible-playbook roles/system/tasks/main.yml
+	KUBECONFIG=config/k3s.yaml ansible-playbook roles/system/tasks/main.yml
 
 setup: copy-k3s-config ## Set up the environment (KUBECONFIG, Python venv, tutor)
 	KUBECONFIG=$(CURDIR)/config/k3s.yaml ansible-playbook playbooks/setup.yml

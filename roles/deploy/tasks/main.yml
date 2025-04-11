@@ -94,36 +94,40 @@
     state: present
     kubeconfig: "{{ kubeconfig }}"
 
-- name: Check if indigo plugin is enabled
+- name: Check if plugins are enabled
   ansible.builtin.command: "{{ venv_dir }}/bin/tutor plugins list"
   register: plugins_list
   changed_when: false
 
-- name: Install and enable indigo plugin if needed
-  block:
-    - name: Install tutor-indigo
-      ansible.builtin.pip:
-        name: tutor-indigo
-        state: present
-        virtualenv: "{{ venv_dir }}"
-      
-    - name: Enable indigo plugin
-      ansible.builtin.command: "{{ venv_dir }}/bin/tutor plugins enable indigo"
-      changed_when: true
+- name: Install latest recommended Tutor plugins
+  ansible.builtin.pip:
+    name:
+      - tutor-mfe
+      - tutor-indigo
+      - tutor-discovery
+      - tutor-ecommerce
+    state: latest
+    virtualenv: "{{ venv_dir }}"
+
+- name: Enable indigo plugin if needed
+  ansible.builtin.command: "{{ venv_dir }}/bin/tutor plugins enable indigo"
+  changed_when: true
   when: "'indigo.*enabled' not in plugins_list.stdout"
 
-- name: Install and enable mfe plugin if needed
-  block:
-    - name: Install tutor-mfe
-      ansible.builtin.pip:
-        name: tutor-mfe
-        state: present
-        virtualenv: "{{ venv_dir }}"
-      
-    - name: Enable mfe plugin
-      ansible.builtin.command: "{{ venv_dir }}/bin/tutor plugins enable mfe"
-      changed_when: true
+- name: Enable mfe plugin if needed
+  ansible.builtin.command: "{{ venv_dir }}/bin/tutor plugins enable mfe"
+  changed_when: true
   when: "'mfe.*enabled' not in plugins_list.stdout"
+
+- name: Enable discovery plugin if needed
+  ansible.builtin.command: "{{ venv_dir }}/bin/tutor plugins enable discovery"
+  changed_when: true
+  when: "'discovery.*enabled' not in plugins_list.stdout"
+
+- name: Enable ecommerce plugin if needed
+  ansible.builtin.command: "{{ venv_dir }}/bin/tutor plugins enable ecommerce"
+  changed_when: true
+  when: "'ecommerce.*enabled' not in plugins_list.stdout"
 
 - name: Check if Docker registry authentication is configured
   kubernetes.core.k8s_info:
@@ -138,12 +142,25 @@
     name: registry
   when: registry_auth.resources | length == 0
 
-- name: Configure Tutor with proper hostnames
-  ansible.builtin.command: "{{ venv_dir }}/bin/tutor config save --set {{ item.key }}={{ item.value }}"
-  loop:
-    - { key: "LMS_HOST", value: "{{ lms_host }}" }
-    - { key: "CMS_HOST", value: "{{ cms_host }}" }
-  changed_when: true
+- name: Configure Tutor with proper hostnames and settings
+  ansible.builtin.command: "{{ venv_dir }}/bin/tutor config save --set LMS_HOST={{ lms_host }} --set CMS_HOST={{ cms_host }}"
+  register: tutor_config
+
+- name: Configure resource limits for Kubernetes deployment
+  ansible.builtin.shell: |
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_LMS_LIMITS_CPU={{ resource_limits.lms.cpu }}
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_LMS_LIMITS_MEMORY={{ resource_limits.lms.memory }}
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_CMS_LIMITS_CPU={{ resource_limits.cms.cpu }}
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_CMS_LIMITS_MEMORY={{ resource_limits.cms.memory }}
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_MYSQL_LIMITS_CPU={{ resource_limits.mysql.cpu }}
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_MYSQL_LIMITS_MEMORY={{ resource_limits.mysql.memory }}
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_MONGODB_LIMITS_CPU={{ resource_limits.mongodb.cpu }}
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_MONGODB_LIMITS_MEMORY={{ resource_limits.mongodb.memory }}
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_ELASTICSEARCH_LIMITS_CPU={{ resource_limits.elasticsearch.cpu }}
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_ELASTICSEARCH_LIMITS_MEMORY={{ resource_limits.elasticsearch.memory }}
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_REDIS_LIMITS_CPU={{ resource_limits.redis.cpu }}
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_REDIS_LIMITS_MEMORY={{ resource_limits.redis.memory }}
+  register: resource_config
 
 - name: Save Tutor configuration
   ansible.builtin.command: "{{ venv_dir }}/bin/tutor config save"

@@ -17,9 +17,10 @@ Tutor is the official Docker-based Open edX distribution. This setup allows you 
 ## Prerequisites
 
 - A running K3s cluster deployed with the tfgrid-k3s project
-- Python 3.6+ installed on your local machine
+- Python 3.8+ installed on your local machine
 - kubectl installed on your local machine
-- Ansible 2.9+ installed on your local machine
+- Ansible 2.12+ installed on your local machine
+- At least 4GB of RAM and 2 CPU cores available on your K3s cluster
 
 ## Installation and Setup
 
@@ -44,7 +45,7 @@ After your K3s cluster is up and running:
 # Navigate back to the parent directory (where tfgrid-k3s is located)
 cd ..
 
-# Clone the tutor-k3s-ansible repository next to tfgrid-k3s
+# Clone the tutor-k3s repository next to tfgrid-k3s
 git clone https://github.com/mik-tf/tutor-k3s
 cd tutor-k3s
 ```
@@ -86,7 +87,7 @@ Each step performs the following functions:
 
 **make prepare**:
 - Creates the necessary 'openedx' namespace
-- Installs required Tutor plugins (mfe, indigo)
+- Installs and enables required Tutor plugins (mfe, indigo, discovery, ecommerce)
 - Sets up storage classes if needed
 - Installs an ingress controller if not present
 
@@ -271,4 +272,4 @@ This project uses Ansible to organize the deployment process:
 
 ## License
 
-This project is licensed under the same license as the original tutor-k3s project.
+This project is licensed under the MIT License.

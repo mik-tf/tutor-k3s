@@ -24,3 +24,24 @@ cms_host: "studio.local"
 # Deployment settings
 max_retries: 30
 retry_interval: 10  # seconds
+
+# Resource management settings
+resource_limits:
+  lms:
+    cpu: "2"
+    memory: "2Gi"
+  cms:
+    cpu: "2"
+    memory: "2Gi"
+  mysql:
+    cpu: "1"
+    memory: "1Gi"
+  mongodb:
+    cpu: "1"
+    memory: "1Gi"
+  elasticsearch:
+    cpu: "1"
+    memory: "2Gi"
+  redis:
+    cpu: "0.5"
+    memory: "512Mi"

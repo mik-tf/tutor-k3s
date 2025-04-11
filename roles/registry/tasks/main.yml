@@ -68,6 +68,8 @@
       metadata:
         name: dockerhub-creds
         namespace: "{{ openedx_namespace }}"
+        annotations:
+          kubernetes.io/description: "Docker registry credentials for accessing Open edX images"
       type: kubernetes.io/dockerconfigjson
       data:
         .dockerconfigjson: >
@@ -75,6 +77,15 @@
             {
               "auths": {
                 "docker.io": {
+                  "username": docker_username,
+                  "password": docker_token,
+                  "email": docker_email,
+                  "auth": (docker_username + ':' + docker_token) | b64encode
+                },
+                "ghcr.io": {
+                  "username": docker_username,
+                  "password": docker_token,
+                  "email": docker_email,
                   "auth": (docker_username + ':' + docker_token) | b64encode
                 }
               }

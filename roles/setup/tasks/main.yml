@@ -69,8 +69,8 @@
 
 - name: Install tutor in virtual environment
   ansible.builtin.pip:
-    name: tutor
-    state: present
+    name: tutor[full]
+    state: latest
     virtualenv: "{{ venv_dir }}"
 
 - name: Install kubernetes Python library in virtual environment
