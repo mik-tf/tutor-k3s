@@ -126,22 +126,59 @@
     msg: "Local-path storage provisioner installed and set as default"
   when: default_sc_result is defined and default_sc_result.changed
 
-- name: Check for NGINX ingress controller
+- name: Check if ingress-nginx namespace exists
   kubernetes.core.k8s_info:
-    kind: Pod
-    namespace: kube-system
-    label_selectors:
-      - app=ingress-nginx
+    api_version: v1
+    kind: Namespace
+    name: ingress-nginx
     kubeconfig: "{{ kubeconfig }}"
-  register: ingress_pods
+  register: ingress_namespace
+  ignore_errors: true
 
-- name: Install NGINX ingress controller if not found
-  kubernetes.core.k8s:
-    src: https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.12.1/deploy/static/provider/cloud/deploy.yaml
-    state: present
-    kubeconfig: "{{ kubeconfig }}"
-  when: ingress_pods.resources | length == 0
+- name: Complete NGINX ingress controller cleanup
+  block:
+    # First remove webhook configs to avoid validation issues
+    - name: Remove validating webhook configuration
+      kubernetes.core.k8s:
+        kind: ValidatingWebhookConfiguration
+        name: ingress-nginx-admission
+        state: absent
+        kubeconfig: "{{ kubeconfig }}"
+      ignore_errors: true
+
+    - name: Delete entire ingress-nginx namespace
+      kubernetes.core.k8s:
+        kind: Namespace
+        name: ingress-nginx
+        state: absent
+        kubeconfig: "{{ kubeconfig }}"
+      ignore_errors: true
+
+    - name: Wait for namespace deletion
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: ingress-nginx
+        kubeconfig: "{{ kubeconfig }}"
+      register: ns_check
+      until: ns_check.resources | length == 0
+      retries: 15
+      delay: 5
+      ignore_errors: true
+
+    - name: Display cleanup status
+      debug:
+        msg: "NGINX ingress controller namespace successfully removed"
+      when: ns_check.resources | length == 0
+  when: ingress_namespace.resources | length > 0
+
+- name: Apply NGINX ingress controller manifest
+  shell: |
+    kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.12.1/deploy/static/provider/cloud/deploy.yaml
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
   register: ingress_result
+  changed_when: ingress_result.rc == 0
 
 - name: Display ingress controller setup results
   debug:
