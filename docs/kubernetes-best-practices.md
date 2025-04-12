@@ -21,13 +21,14 @@ This document outlines Kubernetes configuration best practices for Open edX depl
 
 For optimal reliability and performance, follow these control plane configurations based on deployment size:
 
-| Deployment Size | Control Plane Configuration |
-|-----------------|----------------------------|
-| Testing/Development | 1 control plane node (4 vCPU, 8GB RAM) |
-| Small Production | 3 control plane nodes (4 vCPU, 8GB RAM each) |
-| Medium Production | 3 control plane nodes (4 vCPU, 8GB RAM each) |
-| Large Production | 3 control plane nodes (8 vCPU, 16GB RAM each) |
-| Enterprise | 5 control plane nodes (8 vCPU, 16GB RAM each) |
+| Deployment Size | Control Plane Configuration | Node Count |
+|-----------------|----------------------------|------------|
+| Testing/Development | 1 control plane node (4 vCPU, 8GB RAM) | 1 control + 2 workers |
+| Testing/Dev Minimum | 1 control plane node (2 vCPU, 4GB RAM) | 1 control + 2 workers |
+| Small Production | 3 control plane nodes (4 vCPU, 8GB RAM each) | 3 control + 3 workers |
+| Medium Production | 3 control plane nodes (4 vCPU, 8GB RAM each) | 3 control + 5 workers |
+| Large Production | 3 control plane nodes (8 vCPU, 16GB RAM each) | 3 control + 7-10 workers |
+| Enterprise | 5 control plane nodes (8 vCPU, 16GB RAM each) | 5 control + 12+ workers |
 
 **Best Practices for All Production Deployments**:
 - **Node distribution**: Place across different availability zones when possible

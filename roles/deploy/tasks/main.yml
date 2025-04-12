@@ -189,10 +189,10 @@
   changed_when: false
 
 - name: Get container logs for each pod
-  command: kubectl logs -n {{ openedx_namespace }} {{ item.metadata.name }}
-  loop: "{{ pods_json.stdout | from_json.items }}"
+  command: kubectl logs -n {{ openedx_namespace }} {{ item }}
+  loop: "{{ pods_json.stdout | from_json | json_query('items[*].metadata.name') }}"
   loop_control:
-    label: "{{ item.metadata.name }}"
+    label: "{{ item }}"
   register: pod_logs
   changed_when: false
   ignore_errors: true

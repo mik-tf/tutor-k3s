@@ -38,14 +38,18 @@ Below are the optimal hardware configurations for Open edX deployments of differ
 ```
 Control plane nodes (1):
 - CPU: 4 vCores
-- Memory: 8 GB
+- Memory: 8 GB (minimum 4GB) 
 - Disk: 100 GB SSD
 
 Worker nodes (2):
-- CPU: 8 vCores
-- Memory: 16 GB
+- CPU: 8 vCores (minimum 4 vCores)
+- Memory: 16 GB (minimum 8GB per node)
 - Disk: 250 GB SSD
 ```
+
+**Absolute Minimum (not recommended for production):**
+- 1 control node: 2 vCPU, 4GB RAM
+- 2 worker nodes: 4 vCPU, 8GB RAM each
 
 **Capacity**: Supports ~25-50 concurrent active students
 
@@ -53,6 +57,7 @@ Worker nodes (2):
 - For testing and small pilots, a single control plane node is acceptable
 - This configuration provides sufficient resources for a smooth experience during testing
 - Suitable for instructor training, course development, and small pilot classes
+- Using less than the recommended minimum RAM will likely cause pod scheduling failures
 
 ### Small Production Environment (50-150 Students)
 
@@ -233,8 +238,8 @@ When planning capacity, consider:
 ### Case Study 1: Small Online School (100 students)
 
 **Infrastructure**:
-- 3 control plane (2 CPU, 4 GB RAM)
-- 3 worker nodes (4 CPU, 8 GB RAM)
+- 3 control plane (4 CPU, 8 GB RAM)
+- 3 worker nodes (8 CPU, 16 GB RAM)
 
 **Performance**:
 - Average page load time: 1.5s
@@ -313,4 +318,4 @@ When planning capacity, consider:
 
 Proper resource allocation and capacity planning are essential for a successful Open edX deployment on Kubernetes. Start with the recommended configurations for your expected user base and implement a robust monitoring system to identify scaling needs proactively. Regular performance testing, especially before high-usage periods like course launches or exams, will help ensure a smooth experience for all users.
 
-For the current specifications in your deployment, you can expect to support approximately 25-50 concurrent active students. However, upgrading to the recommended specifications would allow for a more reliable experience supporting 100-150 concurrent users, which typically corresponds to a total enrollment of 500-1000 students, assuming typical attendance and usage patterns.
+For optimal performance with your Mathematics, Physics, and Metaphysics educational platform, we highly recommend adhering to the specified hardware requirements above. For the early testing phase, the minimum testing configuration will support approximately 25-50 concurrent active students. As your program grows, upgrading to the small or medium production configurations would allow for a more reliable experience supporting 100-500 concurrent users, which typically corresponds to a total enrollment of 500-2500 students, assuming typical attendance and usage patterns.
