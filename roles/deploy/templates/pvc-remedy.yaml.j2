@@ -1,0 +1,94 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pvc-recovery-script
+  namespace: kube-system
+data:
+  recover-pvcs.sh: |
+    #!/bin/bash
+    set -e
+    
+    echo "Running PVC recovery script..."
+    
+    # List all PVCs with their nodes
+    kubectl get pvc -A -o json | jq -r '.items[] | select(.metadata.annotations."volume.kubernetes.io/selected-node" != null) | [.metadata.namespace, .metadata.name, .metadata.annotations."volume.kubernetes.io/selected-node"] | @tsv' > /tmp/pvcs.txt
+    
+    # Get list of NotReady nodes
+    kubectl get nodes -o json | jq -r '.items[] | select(.status.conditions[] | select(.type == "Ready" and .status != "True")) | .metadata.name' > /tmp/notready_nodes.txt
+    
+    # For each PVC bound to a NotReady node, try to delete the finalizers
+    while IFS=$'\t' read -r namespace pvc_name node; do
+      if grep -q "$node" /tmp/notready_nodes.txt; then
+        echo "Found PVC $namespace/$pvc_name bound to NotReady node $node"
+        
+        # Get PV name
+        pv_name=$(kubectl get pvc -n "$namespace" "$pvc_name" -o jsonpath='{.spec.volumeName}')
+        if [ -n "$pv_name" ]; then
+          echo "Attempting to patch PV $pv_name to remove node affinity"
+          
+          # Create a patch to remove node affinity
+          cat > /tmp/patch.json << EOF
+          [
+            {"op": "remove", "path": "/spec/nodeAffinity"}
+          ]
+          EOF
+          
+          # Apply the patch - this might fail but we're doing this as a best effort
+          kubectl patch pv "$pv_name" --type=json --patch-file=/tmp/patch.json || echo "Failed to patch PV, continuing anyway"
+          
+          # Restart the pod using this PVC if possible
+          pod=$(kubectl get pods -n "$namespace" -o json | jq -r ".items[] | select(.spec.volumes[] | select(.persistentVolumeClaim.claimName == \"$pvc_name\")) | .metadata.name")
+          if [ -n "$pod" ]; then
+            echo "Deleting pod $namespace/$pod to trigger recreation"
+            kubectl delete pod -n "$namespace" "$pod" --force --grace-period=0 || echo "Failed to delete pod, continuing anyway"
+          fi
+        fi
+      fi
+    done < /tmp/pvcs.txt
+    
+    echo "PVC recovery script completed"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pvc-recovery
+  namespace: kube-system
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: openedx-admin
+      containers:
+      - name: kubectl
+        image: bitnami/kubectl:latest
+        command:
+        - /bin/bash
+        - -c
+        - "cd /scripts && chmod +x recover-pvcs.sh && ./recover-pvcs.sh"
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+      volumes:
+      - name: scripts
+        configMap:
+          name: pvc-recovery-script
+      restartPolicy: OnFailure
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openedx-admin
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: openedx-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: openedx-admin
+  namespace: kube-system

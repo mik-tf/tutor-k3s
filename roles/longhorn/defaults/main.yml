@@ -1,0 +1,4 @@
+---
+# Default variables for Longhorn
+longhorn_replica_count: 2
+longhorn_enable_snapshots: true

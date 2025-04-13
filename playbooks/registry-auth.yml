@@ -1,5 +1,4 @@
----
-# Registry auth playbook - runs the registry role
+# Registry auth playbook - configures Docker registry authentication with resilient retry
 
 - name: Configure Docker Registry Authentication
   hosts: localhost
@@ -14,7 +13,52 @@
     - name: Set Python interpreter
       set_fact:
         ansible_python_interpreter: "{{ venv_dir }}/bin/python3"
+        
+    - name: Set explicit kubeconfig path
+      set_fact:
+        kubeconfig: "{{ kubeconfig_path }}"
       
-    - name: Run registry role
+    - name: Show kubeconfig path
+      debug:
+        msg: "Using kubeconfig: {{ kubeconfig }}"
+    
+    - name: Check Kubernetes API server status
+      ansible.builtin.shell: |
+        set -e
+        echo "Checking Kubernetes API server status..."
+        # First try with short timeout
+        if kubectl get nodes --request-timeout=5s > /dev/null 2>&1; then
+          echo "API server is responsive"
+          exit 0
+        fi
+        echo "API server not immediately responsive, will use retry mechanism"
+        exit 1
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: api_check
+      ignore_errors: true
+      changed_when: false
+      
+    - name: Run standard registry role
       include_role:
         name: registry
+      when: api_check.rc == 0
+      
+    - name: Run resilient registry tasks
+      include_role:
+        name: registry
+        tasks_from: retry
+      when: api_check.rc != 0
+
+    - name: Display summary
+      debug:
+        msg: |
+          Docker Registry Authentication Configuration Summary:
+          
+          - Uses credentials for: {{ docker_username | default('Not configured') }}
+          - Target namespace: {{ openedx_namespace }}
+          - Idempotent: Yes (can be run multiple times safely)
+          - API server connection status: {{ 'Connected' if api_check.rc == 0 else 'Connection issues detected' }}
+          
+          If you encounter ImagePullBackOff errors during deployment,
+          you can safely run 'make registry-auth' again at any time.

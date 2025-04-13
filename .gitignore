@@ -58,3 +58,6 @@ vault-password-file
 
 # K3s specific
 k3s.yaml
+
+# AI Generated
+all_files_text.txt

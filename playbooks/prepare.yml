@@ -14,6 +14,14 @@
     - name: Set Python interpreter
       set_fact:
         ansible_python_interpreter: "{{ venv_dir }}/bin/python3"
+        
+    - name: Set explicit kubeconfig path
+      set_fact:
+        kubeconfig: "{{ kubeconfig_path }}"
+      
+    - name: Show kubeconfig path
+      debug:
+        msg: "Using kubeconfig: {{ kubeconfig }}"
       
     - name: Run prepare role
       include_role:

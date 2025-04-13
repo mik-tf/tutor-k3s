@@ -1,0 +1,227 @@
+---
+# Resilient registry authentication tasks with exponential backoff
+
+- name: Check if kubectl is available
+  ansible.builtin.command: which kubectl
+  register: kubectl_check
+  ignore_errors: true
+  changed_when: false
+
+- name: Ensure API server is responsive with exponential backoff
+  ansible.builtin.shell: |
+    for i in 2 4 8 16 32; do
+      echo "Attempt with $i second timeout..."
+      if kubectl get nodes --request-timeout=${i}s &>/dev/null; then
+        echo "API server is responsive!"
+        exit 0
+      fi
+      echo "API server not responding with ${i}s timeout. Waiting before trying again..."
+      sleep $i
+    done
+    echo "API server not responding after multiple attempts with increasing timeouts"
+    exit 1
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: api_ready
+  changed_when: false
+  failed_when: false
+
+- name: Set registry configuration from direct inputs or environment
+  block:
+    - name: Set Docker Hub credentials from environment or variables
+      ansible.builtin.set_fact:
+        docker_username: "{{ lookup('env', 'DOCKER_USERNAME') | default(docker_username) | default('') }}"
+        docker_token: "{{ lookup('env', 'DOCKER_TOKEN') | default(docker_token) | default('') }}"
+        docker_email: "{{ lookup('env', 'DOCKER_EMAIL') | default(docker_email) | default('') }}"
+
+    - name: Check if .env file exists for retry
+      ansible.builtin.stat:
+        path: "{{ project_root }}/.env"
+      register: env_file_retry
+
+    - name: Source variables from .env file for retry
+      ansible.builtin.shell: |
+        set -a
+        source {{ project_root }}/.env
+        set +a
+        echo "DOCKER_USERNAME=${DOCKER_USERNAME:-empty}"
+        echo "DOCKER_TOKEN=${DOCKER_TOKEN:-empty}"
+        echo "DOCKER_EMAIL=${DOCKER_EMAIL:-empty}"
+      register: env_vars_retry
+      when: env_file_retry.stat.exists
+      changed_when: false
+
+    - name: Extract Docker credentials from .env file for retry
+      ansible.builtin.set_fact:
+        docker_username: "{{ env_vars_retry.stdout_lines[0].split('=')[1] }}"
+        docker_token: "{{ env_vars_retry.stdout_lines[1].split('=')[1] }}"
+        docker_email: "{{ env_vars_retry.stdout_lines[2].split('=')[1] }}"
+      when: env_file_retry.stat.exists and env_vars_retry.stdout is defined
+
+    - name: Prompt for Docker Hub username if missing (retry)
+      ansible.builtin.pause:
+        prompt: "Enter your Docker Hub username (required to avoid rate limits)"
+      register: docker_username_prompt_retry
+      when: docker_username == '' or docker_username == 'empty'
+
+    - name: Set Docker Hub username from prompt (retry)
+      ansible.builtin.set_fact:
+        docker_username: "{{ docker_username_prompt_retry.user_input }}"
+      when: docker_username_prompt_retry is defined and docker_username_prompt_retry.user_input is defined
+
+    - name: Prompt for Docker Hub token/password if missing (retry)
+      ansible.builtin.pause:
+        prompt: "Enter your Docker Hub token or password (required to avoid rate limits)"
+        echo: no
+      register: docker_token_prompt_retry
+      when: docker_token == '' or docker_token == 'empty'
+
+    - name: Set Docker Hub token from prompt (retry)
+      ansible.builtin.set_fact:
+        docker_token: "{{ docker_token_prompt_retry.user_input }}"
+      when: docker_token_prompt_retry is defined and docker_token_prompt_retry.user_input is defined
+
+    - name: Prompt for Docker Hub email if missing (retry)
+      ansible.builtin.pause:
+        prompt: "Enter your email address for Docker Hub"
+      register: docker_email_prompt_retry
+      when: docker_email == '' or docker_email == 'empty'
+
+    - name: Set Docker Hub email from prompt (retry)
+      ansible.builtin.set_fact:
+        docker_email: "{{ docker_email_prompt_retry.user_input }}"
+      when: docker_email_prompt_retry is defined and docker_email_prompt_retry.user_input is defined
+
+    - name: Create registry secret using kubectl with retries and increased timeouts
+      ansible.builtin.shell: |
+        set -e
+        echo "Using resilient registry setup with increased timeouts..."
+        
+        # Create namespace if it doesn't exist
+        kubectl create namespace {{ openedx_namespace }} --dry-run=client -o yaml | kubectl apply -f - --validate=false --request-timeout=60s
+        echo "Namespace verification complete"
+        
+        # Wait to ensure API server is still responding
+        sleep 2
+        
+        # Remove old secret if it exists
+        kubectl delete secret -n {{ openedx_namespace }} dockerhub-creds --ignore-not-found=true --request-timeout=60s || true
+        echo "Old secret cleanup complete"
+        
+        # Wait to ensure delete completes
+        sleep 5
+        
+        # Create auth config
+        cat > /tmp/resilient-docker-config.json << EOF
+        {
+          "auths": {
+            "docker.io": {
+              "username": "{{ docker_username }}",
+              "password": "{{ docker_token }}",
+              "email": "{{ docker_email }}",
+              "auth": "$(echo -n {{ docker_username }}:{{ docker_token }} | base64)"
+            }
+          }
+        }
+        EOF
+        
+        # Create new secret
+        echo "Creating new registry secret..."
+        kubectl create secret generic dockerhub-creds \
+          --namespace {{ openedx_namespace }} \
+          --type=kubernetes.io/dockerconfigjson \
+          --from-file=.dockerconfigjson=/tmp/resilient-docker-config.json \
+          --request-timeout=60s
+        
+        echo "Registry secret created"
+        
+        # Wait to ensure secret is available
+        sleep 5
+        
+        # Patch default service account
+        echo "Patching default service account..."
+        kubectl patch serviceaccount default -n {{ openedx_namespace }} \
+          --patch '{"imagePullSecrets": [{"name": "dockerhub-creds"}]}' \
+          --request-timeout=60s
+        
+        echo "Registry configuration complete"
+        
+        # Clean up
+        rm -f /tmp/resilient-docker-config.json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: registry_setup
+      retries: 10
+      delay: 15
+      until: registry_setup.rc == 0
+      changed_when: registry_setup.rc == 0
+      when: api_ready.rc == 0
+  when: api_ready.rc == 0
+
+- name: Handle API server unavailability
+  block:
+    - name: Create local registry configuration for later application
+      ansible.builtin.copy:
+        content: |
+          #!/bin/bash
+          # Registry configuration script created because API server was unavailable
+          # Run this script manually when the cluster is stable
+          
+          NAMESPACE="{{ openedx_namespace }}"
+          
+          # Create namespace
+          kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Delete old secret if it exists
+          kubectl delete secret -n $NAMESPACE dockerhub-creds --ignore-not-found=true
+          
+          # Create Docker registry auth configuration
+          cat > /tmp/docker-config.json << EOF
+          {
+            "auths": {
+              "docker.io": {
+                "username": "{{ docker_username }}",
+                "password": "{{ docker_token }}",
+                "email": "{{ docker_email }}",
+                "auth": "{{ (docker_username + ':' + docker_token) | b64encode }}"
+              }
+            }
+          }
+          EOF
+          
+          # Create registry secret
+          kubectl create secret generic dockerhub-creds \
+            --namespace $NAMESPACE \
+            --type=kubernetes.io/dockerconfigjson \
+            --from-file=.dockerconfigjson=/tmp/docker-config.json
+          
+          # Patch default service account
+          kubectl patch serviceaccount default -n $NAMESPACE \
+            --patch '{"imagePullSecrets": [{"name": "dockerhub-creds"}]}'
+          
+          echo "Registry configuration applied"
+          
+          # Clean up
+          rm -f /tmp/docker-config.json
+        dest: "{{ project_root }}/registry-config.sh"
+        mode: '0755'
+      when: docker_username != '' and docker_username != 'empty' and docker_token != '' and docker_token != 'empty'
+  when: api_ready.rc != 0
+
+- name: Report registry auth status
+  debug:
+    msg: |
+      {% if api_ready.rc != 0 %}
+      ⚠️ Kubernetes API server is not responding after multiple retry attempts. 
+      
+      A registry configuration script has been created at:
+      {{ project_root }}/registry-config.sh
+      
+      You can run this script manually when the cluster is stable.
+      {% elif registry_setup is defined and registry_setup.rc == 0 %}
+      ✅ Docker registry authentication successfully configured using resilient method.
+      This will prevent Docker Hub rate limiting issues.
+      {% else %}
+      ⚠️ Docker registry authentication may not be properly configured.
+      If deployment fails with ImagePullBackOff errors, retry with 'make registry-auth'.
+      {% endif %}

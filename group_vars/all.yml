@@ -3,13 +3,17 @@
 
 # Path settings
 tfgrid_dir: "{{ playbook_dir }}/../../tfgrid-k3s"
-kubeconfig: "{{ tfgrid_dir }}/k3s.yaml"
+project_root: "{{ playbook_dir | dirname }}"
+
+# K8s configuration
+k8s_config_dir: "{{ project_root }}/config"
+kubeconfig_path: "{{ k8s_config_dir }}/k3s.yaml"
 project_dir: "{{ playbook_dir }}"
 venv_dir: "{{ project_dir }}/venv"
 
 # Kubernetes settings
 openedx_namespace: "openedx"
-min_file_descriptors: 65535
+min_file_descriptors: 1048576
 
 # Docker Hub credentials
 # These can be overridden via environment variables or in host_vars
@@ -45,3 +49,7 @@ resource_limits:
   redis:
     cpu: "0.5"
     memory: "512Mi"
+
+# Longhorn storage settings
+longhorn_replica_count: 2  # Number of replicas for volumes
+longhorn_enable_snapshots: true

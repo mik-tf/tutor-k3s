@@ -1,5 +1,5 @@
 ---
-# Registry role - replaces configure-registry-auth.sh
+# Enhanced registry authentication with improved idempotency and API server resilience
 
 - name: Check if kubectl is available
   ansible.builtin.command: which kubectl
@@ -12,129 +12,259 @@
     msg: "Error: kubectl is not installed or not in PATH"
   when: kubectl_check.rc != 0
 
-- name: Create openedx namespace if it doesn't exist
-  kubernetes.core.k8s:
-    api_version: v1
-    kind: Namespace
-    name: "{{ openedx_namespace }}"
-    state: present
-    kubeconfig: "{{ kubeconfig }}"
+- name: Wait for Kubernetes API server to be available
+  ansible.builtin.shell: |
+    set -e
+    for attempt in $(seq 1 10); do
+      echo "Attempt $attempt: Checking API server availability..."
+      if kubectl get nodes --request-timeout=10s > /dev/null 2>&1; then
+        echo "API server is available!"
+        exit 0
+      fi
+      echo "API server not available yet. Waiting 10 seconds..."
+      sleep 10
+    done
+    echo "API server not available after 10 attempts"
+    exit 1
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: api_check
+  retries: 3
+  delay: 5
+  until: api_check.rc == 0
+  changed_when: false
+  failed_when: false
 
-- name: Check Docker Hub credentials
+- name: Create openedx namespace if it doesn't exist
+  ansible.builtin.shell: |
+    kubectl create namespace {{ openedx_namespace }} --dry-run=client -o yaml | kubectl apply -f - --validate=false --request-timeout=20s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: namespace_result
+  retries: 5
+  delay: 10
+  until: namespace_result.rc == 0 or "AlreadyExists" in namespace_result.stderr or "unchanged" in namespace_result.stdout
+  changed_when: namespace_result.rc == 0 and "created" in namespace_result.stdout
+  failed_when: false
+  when: api_check.rc == 0
+
+- name: Set Docker Hub credential variables from environment
   ansible.builtin.set_fact:
-    docker_creds_missing: "{{ docker_username == '' or docker_token == '' or docker_email == '' }}"
+    docker_username: "{{ lookup('env', 'DOCKER_USERNAME') | default('') }}"
+    docker_token: "{{ lookup('env', 'DOCKER_TOKEN') | default('') }}"
+    docker_email: "{{ lookup('env', 'DOCKER_EMAIL') | default('') }}"
+
+- name: Check if .env file exists
+  ansible.builtin.stat:
+    path: "{{ project_root }}/.env"
+  register: env_file
+
+- name: Source variables from .env file if it exists
+  ansible.builtin.shell: |
+    set -a
+    source {{ project_root }}/.env
+    set +a
+    echo "DOCKER_USERNAME=${DOCKER_USERNAME:-empty}"
+    echo "DOCKER_TOKEN=${DOCKER_TOKEN:-empty}"
+    echo "DOCKER_EMAIL=${DOCKER_EMAIL:-empty}"
+  register: env_vars
+  when: env_file.stat.exists
+  changed_when: false
+
+- name: Extract Docker credentials from .env file
+  ansible.builtin.set_fact:
+    docker_username: "{{ env_vars.stdout_lines[0].split('=')[1] }}"
+    docker_token: "{{ env_vars.stdout_lines[1].split('=')[1] }}"
+    docker_email: "{{ env_vars.stdout_lines[2].split('=')[1] }}"
+  when: env_file.stat.exists and env_vars.stdout is defined
 
 - name: Prompt for Docker Hub username if missing
   ansible.builtin.pause:
-    prompt: "Enter your Docker Hub username"
+    prompt: "Enter your Docker Hub username (required to avoid rate limits)"
   register: docker_username_prompt
-  when: docker_username == ''
+  when: (docker_username == '' or docker_username == 'empty') and api_check.rc == 0
 
 - name: Set Docker Hub username from prompt
   ansible.builtin.set_fact:
     docker_username: "{{ docker_username_prompt.user_input }}"
-  when: docker_username == '' and docker_username_prompt is defined
+  when: docker_username_prompt is defined and docker_username_prompt.user_input is defined
 
 - name: Prompt for Docker Hub token/password if missing
   ansible.builtin.pause:
-    prompt: "Enter your Docker Hub token/password"
+    prompt: "Enter your Docker Hub token or password (required to avoid rate limits)"
     echo: no
   register: docker_token_prompt
-  when: docker_token == ''
+  when: (docker_token == '' or docker_token == 'empty') and api_check.rc == 0
 
 - name: Set Docker Hub token from prompt
   ansible.builtin.set_fact:
     docker_token: "{{ docker_token_prompt.user_input }}"
-  when: docker_token == '' and docker_token_prompt is defined
+  when: docker_token_prompt is defined and docker_token_prompt.user_input is defined
 
 - name: Prompt for Docker Hub email if missing
   ansible.builtin.pause:
-    prompt: "Enter your email address"
+    prompt: "Enter your email address for Docker Hub"
   register: docker_email_prompt
-  when: docker_email == ''
+  when: (docker_email == '' or docker_email == 'empty') and api_check.rc == 0
 
 - name: Set Docker Hub email from prompt
   ansible.builtin.set_fact:
     docker_email: "{{ docker_email_prompt.user_input }}"
-  when: docker_email == '' and docker_email_prompt is defined
+  when: docker_email_prompt is defined and docker_email_prompt.user_input is defined
 
-- name: Create Docker Hub credentials secret
-  kubernetes.core.k8s:
-    state: present
-    kubeconfig: "{{ kubeconfig }}"
-    definition:
-      apiVersion: v1
-      kind: Secret
-      metadata:
-        name: dockerhub-creds
-        namespace: "{{ openedx_namespace }}"
-        annotations:
-          kubernetes.io/description: "Docker registry credentials for accessing Open edX images"
-      type: kubernetes.io/dockerconfigjson
-      data:
-        .dockerconfigjson: >
-          {{
-            {
-              "auths": {
-                "docker.io": {
-                  "username": docker_username,
-                  "password": docker_token,
-                  "email": docker_email,
-                  "auth": (docker_username + ':' + docker_token) | b64encode
-                },
-                "ghcr.io": {
-                  "username": docker_username,
-                  "password": docker_token,
-                  "email": docker_email,
-                  "auth": (docker_username + ':' + docker_token) | b64encode
-                }
-              }
-            } | to_json | b64encode
-          }}
-
-- name: Configure default service account to use the credentials
-  kubernetes.core.k8s_json_patch:
-    kind: ServiceAccount
-    name: default
-    namespace: "{{ openedx_namespace }}"
-    kubeconfig: "{{ kubeconfig }}"
-    patch:
-      - op: add
-        path: /imagePullSecrets
-        value:
-          - name: dockerhub-creds
-  register: patch_default_sa
-
-- name: Get list of service accounts to patch
+- name: Generate dockerconfigjson content
   ansible.builtin.set_fact:
-    service_accounts_to_patch: ["cms", "lms", "mfe"]
+    dockerconfig_json: "{{ {'auths': {'docker.io': {'username': docker_username, 'password': docker_token, 'email': docker_email, 'auth': (docker_username + ':' + docker_token) | b64encode }}} | to_json }}"
+  when: api_check.rc == 0
 
-- name: Check if service accounts exist
-  kubernetes.core.k8s_info:
-    kind: ServiceAccount
-    name: "{{ item }}"
-    namespace: "{{ openedx_namespace }}"
-    kubeconfig: "{{ kubeconfig }}"
-  register: sa_check
-  with_items: "{{ service_accounts_to_patch }}"
-  ignore_errors: true
+- name: Save dockerconfig to temporary file
+  ansible.builtin.copy:
+    content: |
+      {
+        "auths": {
+          "docker.io": {
+            "username": "{{ docker_username }}",
+            "password": "{{ docker_token }}",
+            "email": "{{ docker_email }}",
+            "auth": "{{ (docker_username + ':' + docker_token) | b64encode }}"
+          }
+        }
+      }
+    dest: /tmp/docker-config.json
+    mode: '0600'
+  changed_when: false
+  when: api_check.rc == 0
 
-- name: Create list of service accounts that exist
-  ansible.builtin.set_fact:
-    existing_service_accounts: "{{ sa_check.results | selectattr('resources', 'defined') | 
-                               selectattr('resources.0', 'defined') | 
-                               map(attribute='item') | list }}"
+- name: Check if registry secret already exists
+  ansible.builtin.shell: |
+    kubectl get secret -n {{ openedx_namespace }} dockerhub-creds --request-timeout=15s 2>/dev/null || echo "not found"
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: existing_secret
+  changed_when: false
+  failed_when: false
+  when: api_check.rc == 0
 
-- name: Configure tutor-related service accounts to use the credentials
-  kubernetes.core.k8s_json_patch:
-    kind: ServiceAccount
-    name: "{{ item }}"
-    namespace: "{{ openedx_namespace }}"
-    kubeconfig: "{{ kubeconfig }}"
-    patch:
-      - op: add
-        path: /imagePullSecrets
-        value:
-          - name: dockerhub-creds
-  with_items: "{{ existing_service_accounts }}"
-  register: patch_sa
+- name: Remove any existing registry secret if we need to update it
+  ansible.builtin.shell: |
+    kubectl delete secret -n {{ openedx_namespace }} dockerhub-creds --ignore-not-found=true --request-timeout=30s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: delete_secret
+  retries: 5
+  delay: 10
+  until: delete_secret.rc == 0 or 'NotFound' in delete_secret.stderr or 'not found' in delete_secret.stderr
+  failed_when: false
+  changed_when: delete_secret.rc == 0 and delete_secret.stdout != ""
+  when: api_check.rc == 0 and "'not found' in existing_secret.stdout or existing_secret.rc != 0"
+
+- name: Create Docker registry credentials secret
+  ansible.builtin.shell: |
+    kubectl create secret docker-registry dockerhub-creds \
+      --namespace {{ openedx_namespace }} \
+      --from-file=.dockerconfigjson=/tmp/docker-config.json \
+      --type=kubernetes.io/dockerconfigjson \
+      --request-timeout=30s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: secret_result
+  retries: 5
+  delay: 10
+  until: secret_result.rc == 0 or 'AlreadyExists' in secret_result.stderr
+  changed_when: secret_result.rc == 0 and 'AlreadyExists' not in secret_result.stderr
+  failed_when: false
+  when: api_check.rc == 0
+
+- name: Create registry secret using kubectl apply (backup method)
+  ansible.builtin.shell: |
+    cat <<EOF | kubectl apply -f - --request-timeout=30s
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: dockerhub-creds
+      namespace: {{ openedx_namespace }}
+    type: kubernetes.io/dockerconfigjson
+    data:
+      .dockerconfigjson: "{{ dockerconfig_json | b64encode }}"
+    EOF
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  when: api_check.rc == 0 and secret_result is defined and secret_result.rc != 0 and ('AlreadyExists' not in secret_result.stderr|default(''))
+  register: backup_secret
+  retries: 5
+  delay: 10
+  until: backup_secret.rc == 0
+  changed_when: backup_secret.rc == 0
+  failed_when: false
+
+- name: Wait for secret to be fully available
+  ansible.builtin.pause:
+    seconds: 5
+  when: api_check.rc == 0 and (secret_result.changed|default(false) or backup_secret.changed|default(false))
+
+- name: Check for service accounts in the namespace
+  ansible.builtin.shell: |
+    kubectl get serviceaccount -n {{ openedx_namespace }} -o name --request-timeout=15s || echo "No service accounts found"
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: sa_list
+  changed_when: false
+  failed_when: false
+  when: api_check.rc == 0
+
+- name: Configure service accounts to use the credentials
+  ansible.builtin.shell: |
+    kubectl patch serviceaccount {{ item | regex_replace('serviceaccount/', '') }} -n {{ openedx_namespace }} \
+    --patch '{"imagePullSecrets": [{"name": "dockerhub-creds"}]}' --request-timeout=30s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  when: api_check.rc == 0 and sa_list.stdout != "No service accounts found" and "serviceaccount/" in item
+  loop: "{{ sa_list.stdout_lines | default([]) }}"
+  register: sa_patch
+  retries: 3
+  delay: 10
+  until: sa_patch.rc == 0
+  changed_when: sa_patch.rc == 0
+  failed_when: false
+
+- name: Ensure default service account is patched
+  ansible.builtin.shell: |
+    kubectl patch serviceaccount default -n {{ openedx_namespace }} \
+    --patch '{"imagePullSecrets": [{"name": "dockerhub-creds"}]}' --request-timeout=30s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  when: api_check.rc == 0
+  register: default_sa_patch
+  retries: 3
+  delay: 10
+  until: default_sa_patch.rc == 0
+  changed_when: default_sa_patch.rc == 0
+  failed_when: false
+
+- name: Verify docker registry secret was created
+  ansible.builtin.shell: |
+    kubectl get secret -n {{ openedx_namespace }} dockerhub-creds -o jsonpath='{.type}' --request-timeout=30s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: verify_secret
+  retries: 3
+  delay: 10
+  until: verify_secret.rc == 0 and verify_secret.stdout == "kubernetes.io/dockerconfigjson"
+  failed_when: false
+  changed_when: false
+  when: api_check.rc == 0
+
+- name: Display Docker registry authentication status
+  debug:
+    msg: |
+      Docker registry authentication status:
+      {% if api_check.rc != 0 %}
+      ⚠️ Kubernetes API server is not responding. Registry authentication setup may be incomplete.
+      Try again when the API server is stable by running: make registry-auth
+      {% elif verify_secret.stdout == "kubernetes.io/dockerconfigjson" %}
+      ✅ Docker registry credentials successfully configured for namespace: {{ openedx_namespace }}
+      Service accounts patched: {{ sa_list.stdout_lines | default(['default']) | join(', ') }}
+      {% else %}
+      ⚠️ Docker registry credentials may not be properly configured.
+      You may encounter ImagePullBackOff errors. If so, retry with 'make registry-auth'
+      {% endif %}

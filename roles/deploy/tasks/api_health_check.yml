@@ -1,0 +1,53 @@
+---
+- name: Create API server health check script
+  ansible.builtin.template:
+    src: k3s-api-monitor.sh.j2
+    dest: /tmp/k3s-api-monitor.sh
+    mode: '0755'
+
+- name: Run API server health check
+  ansible.builtin.shell: /tmp/k3s-api-monitor.sh
+  register: api_health_check
+  failed_when: false
+  changed_when: false
+
+- name: Display API health check results
+  debug:
+    msg: "{{ api_health_check.stdout_lines }}"
+
+- name: Set API server health fact
+  set_fact:
+    api_server_healthy: "{{ api_health_check.rc == 0 }}"
+
+- name: Handle unhealthy API server
+  block:
+    - name: Set fact for registry auth bypass
+      set_fact:
+        api_health_skipped: true
+
+    - name: Suggest recovery actions for unhealthy API server
+      debug:
+        msg: |
+          WARNING: K3s API server health check failed. This might be due to:
+          
+          1. Resource pressure on the K3s node(s)
+          2. Network connectivity issues
+          3. K3s service issues
+          
+          Suggested actions:
+          
+          1. Check K3s service status:
+             ssh root@10.1.3.2 "systemctl status k3s"
+          
+          2. Restart K3s service:
+             ssh root@10.1.3.2 "systemctl restart k3s"
+          
+          3. Check node resources:
+             ssh root@10.1.3.2 "free -h && df -h"
+          
+          4. Check K3s logs:
+             ssh root@10.1.3.2 "journalctl -u k3s --no-pager | tail -100"
+          
+          The deployment will continue with enhanced retry mechanisms, but might fail
+          if the API server remains unresponsive.
+  when: not api_server_healthy

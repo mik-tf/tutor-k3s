@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-file-limits-fix
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: node-file-limits-fix
+  template:
+    metadata:
+      labels:
+        app: node-file-limits-fix
+    spec:
+      hostPID: true
+      hostIPC: true
+      hostNetwork: true
+      containers:
+      - name: limits-configurator
+        image: alpine:latest
+        securityContext:
+          privileged: true
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "Configuring file descriptor limits on host..."
+            
+            # Create limits file
+            mkdir -p /host/etc/security/limits.d/
+            cat > /host/etc/security/limits.d/99-openedx-limits.conf << EOF
+            * soft nofile 1048576
+            * hard nofile 1048576
+            root soft nofile 1048576
+            root hard nofile 1048576
+            EOF
+            
+            # Create systemd override directory for K3s
+            mkdir -p /host/etc/systemd/system/k3s.service.d/
+            
+            # Create override file
+            cat > /host/etc/systemd/system/k3s.service.d/limits.conf << EOF
+            [Service]
+            LimitNOFILE=1048576
+            EOF
+            
+            # Create sysctl settings for container runtime
+            cat > /host/etc/sysctl.d/99-kubernetes-file-limits.conf << EOF
+            fs.inotify.max_user_instances=8192
+            fs.inotify.max_user_watches=1048576
+            fs.file-max=1048576
+            EOF
+            
+            # Apply sysctl settings
+            chroot /host sysctl -p /etc/sysctl.d/99-kubernetes-file-limits.conf
+            
+            # Restart containerd and K3s
+            echo "Restarting container runtime and K3s..."
+            chroot /host systemctl daemon-reload
+            chroot /host systemctl restart k3s-agent || true
+            chroot /host systemctl restart k3s || true
+            
+            echo "Applied file descriptor limit fixes to host. Sleeping to keep container running..."
+            sleep 60
+        volumeMounts:
+        - name: host-root
+          mountPath: /host
+      volumes:
+      - name: host-root
+        hostPath:
+          path: /
+      tolerations:
+      - operator: Exists
+      terminationGracePeriodSeconds: 10

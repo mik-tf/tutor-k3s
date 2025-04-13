@@ -19,21 +19,51 @@
   ansible.builtin.shell: export KUBECONFIG="{{ kubeconfig }}"
   args:
     executable: /bin/bash
-
-- name: Test kubectl connection
-  ansible.builtin.command: kubectl cluster-info
+- name: Wait for K3s API server to become ready
+  ansible.builtin.shell: |
+    echo "Waiting for K3s API server to start..."
+    for i in $(seq 1 12); do
+      kubectl cluster-info && echo "API server is ready!" && exit 0
+      echo "Attempt $i/12: API server not ready yet, waiting 10 seconds..."
+      sleep 10
+    done
+    echo "API server still not ready after 2 minutes. Continuing anyway, but deployment may fail."
+    exit 1
   register: kubectl_result
   ignore_errors: true
+  changed_when: false
 
 - name: Display cluster info
   debug:
-    msg: "{{ kubectl_result.stdout_lines }}"
-  when: kubectl_result.rc == 0
+    msg: |
+      API Server Status: {{ "READY" if kubectl_result.rc == 0 else "NOT READY (continuing anyway)" }}
+      {{ kubectl_result.stdout_lines | default([]) }}
 
-- name: Fail if kubectl connection failed
-  fail:
-    msg: "Failed to connect to Kubernetes cluster. Please check your cluster status and credentials."
-  when: kubectl_result.rc != 0
+- name: Set API server status fact
+  set_fact:
+    api_server_ready: "{{ kubectl_result.rc == 0 }}"
+
+- name: Display API server warning
+  debug:
+    msg: |
+      WARNING: The Kubernetes API server is not yet ready.
+      This is normal during initial K3s startup or after a restart.
+      
+      Setup will continue, but some operations may fail until the API server is fully online.
+      If deployment steps fail, simply retry the command after waiting a few minutes.
+  when: not api_server_ready | bool
+
+- name: Get nodes in the cluster (if API server is ready)
+  ansible.builtin.command: kubectl get nodes -o wide
+  register: nodes_result
+  when: api_server_ready | bool
+  changed_when: false
+  ignore_errors: true
+
+- name: Display nodes in the cluster
+  debug:
+    msg: "{{ nodes_result.stdout_lines }}"
+  when: api_server_ready | bool and nodes_result.stdout_lines is defined
 
 - name: Get nodes in the cluster
   ansible.builtin.command: kubectl get nodes -o wide

@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: file-descriptor-fix
+  namespace: kube-system
+  labels:
+    app: file-descriptor-fix
+    managed-by: tutor-k3s-ansible
+spec:
+  selector:
+    matchLabels:
+      name: file-descriptor-fix
+  template:
+    metadata:
+      labels:
+        name: file-descriptor-fix
+    spec:
+      hostPID: true
+      hostIPC: true
+      hostNetwork: true
+      containers:
+      - name: file-descriptor-fix
+        image: alpine:latest
+        securityContext:
+          privileged: true
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "Applying file descriptor fix for containerd on host..."
+            # Create systemd override directory
+            mkdir -p /host/etc/systemd/system/k3s.service.d/
+            
+            # Create limit conf file
+            cat > /host/etc/systemd/system/k3s.service.d/limits.conf <<EOF
+            [Service]
+            LimitNOFILE={{ min_file_descriptors | default('1048576') }}
+            EOF
+            
+            # Reload systemd and restart K3s service
+            chroot /host systemctl daemon-reload
+            echo "Restarting K3s service..."
+            chroot /host systemctl restart k3s
+            
+            # Keep container running but exit after a while so pod completes
+            echo "Fix applied, sleeping for 2 minutes to ensure changes take effect..."
+            sleep 120
+        volumeMounts:
+        - name: host
+          mountPath: /host
+      volumes:
+      - name: host
+        hostPath:
+          path: /
+      tolerations:
+      - operator: Exists
+      restartPolicy: Always

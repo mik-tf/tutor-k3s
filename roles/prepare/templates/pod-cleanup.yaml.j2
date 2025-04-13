@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: container-cleanup-pod
+  namespace: kube-system
+spec:
+  serviceAccountName: default
+  containers:
+  - name: kubectl
+    image: bitnami/kubectl:latest
+    command:
+    - /bin/sh
+    - -c
+    - |
+      echo "Cleaning up stuck pods and containers...";
+      
+      # Delete pods stuck in ImagePullBackOff state
+      for ns in $(kubectl get ns --no-headers -o custom-columns=":metadata.name"); do
+        echo "Checking namespace: $ns";
+        for pod in $(kubectl get pods -n $ns --field-selector=status.phase!=Running,status.phase!=Succeeded,status.phase!=Failed -o jsonpath='{.items[*].metadata.name}'); do
+          if [ ! -z "$pod" ]; then
+            echo "Deleting stuck pod $pod in namespace $ns";
+            kubectl delete pod -n $ns $pod --grace-period=0 --force || true;
+          fi
+        done
+      done;
+      
+      echo "Cleanup complete!";
+      
+      # Sleep briefly so logs can be viewed, then exit
+      # This pod will be deleted by our Ansible playbook
+      sleep 30;
+      exit 0;
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5

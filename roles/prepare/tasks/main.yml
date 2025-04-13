@@ -1,6 +1,18 @@
 ---
 # Prepare role - replaces prepare-k8s.sh
 
+- name: Wait for K3s API server to be ready before proceeding
+  ansible.builtin.shell: |
+    kubectl get nodes
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: k8s_api_check
+  retries: 10
+  delay: 15
+  until: k8s_api_check.rc == 0
+  changed_when: false
+  ignore_errors: true
+
 - name: Check if kubectl is available
   ansible.builtin.command: which kubectl
   register: kubectl_check
@@ -12,18 +24,17 @@
     msg: "Error: kubectl is not installed or not in PATH"
   when: kubectl_check.rc != 0
 
-- name: Create openedx namespace
-  kubernetes.core.k8s:
-    api_version: v1
-    kind: Namespace
-    name: "{{ openedx_namespace }}"
-    state: present
-    kubeconfig: "{{ kubeconfig }}"
+- name: Create openedx namespace using kubectl
+  ansible.builtin.shell: |
+    kubectl create namespace {{ openedx_namespace }} 2>/dev/null || echo "Namespace already exists"
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
   register: namespace_result
+  changed_when: "'already exists' not in namespace_result.stdout"
 
 - name: Display namespace creation result
   debug:
-    msg: "{{ 'Namespace openedx already exists' if namespace_result.changed == false else 'Created namespace openedx' }}"
+    msg: "{{ 'Namespace openedx already exists' if 'already exists' in namespace_result.stdout else 'Created namespace openedx' }}"
 
 - name: Install required Tutor plugins
   ansible.builtin.pip:
@@ -89,98 +100,266 @@
   debug:
     msg: |
       Warning: File descriptor limits are too low for OpenEdX.
+      Current limit: {{ current_limit.stdout }}
+      Required limit: {{ min_file_descriptors }}
       You should manually increase the limits by adding the following to /etc/security/limits.conf:
       * soft nofile {{ min_file_descriptors }}
       * hard nofile {{ min_file_descriptors }}
       Then log out and log back in, or restart your K3s service.
-  when: current_limit.stdout | int < min_file_descriptors | int and (new_limit.stdout | int <= current_limit.stdout | int) and (copy_limits is defined and copy_limits.rc != 0)
+  when: >
+    current_limit.stdout | int < min_file_descriptors | int and 
+    (new_limit is defined and new_limit.stdout | int <= current_limit.stdout | int)
 
-- name: Check storage classes
-  kubernetes.core.k8s_info:
-    kind: StorageClass
-    kubeconfig: "{{ kubeconfig }}"
+- name: Create node file limits template
+  template:
+    src: node-file-limits.yaml.j2
+    dest: /tmp/node-file-limits.yaml
+    mode: '0644'
+
+- name: Apply node file limits fix
+  ansible.builtin.shell: |
+    kubectl apply -f /tmp/node-file-limits.yaml --validate=false
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: node_limits_fix
+  changed_when: node_limits_fix.rc == 0
+  retries: 5
+  delay: 10
+  until: node_limits_fix.rc == 0
+
+- name: Wait for node file limits fix to apply
+  pause:
+    seconds: 30
+  when: node_limits_fix is changed
+
+# Industry standard solution for K3s containerd file descriptor limits using K8s resources
+- name: Check if file descriptor fix has been applied
+  ansible.builtin.shell: |
+    kubectl get daemonset file-descriptor-fix -n kube-system 2>/dev/null || echo "daemonset not found"
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: file_descriptor_fix
+  changed_when: false
+  ignore_errors: true
+
+- name: Create file descriptor fix template
+  template:
+    src: file-descriptor-fix.yaml.j2
+    dest: /tmp/file-descriptor-fix.yaml
+  when: "'daemonset not found' in file_descriptor_fix.stdout"
+
+- name: Apply file descriptor fix DaemonSet
+  ansible.builtin.shell: |
+    kubectl apply -f /tmp/file-descriptor-fix.yaml --validate=false
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: fix_applied
+  when: "'daemonset not found' in file_descriptor_fix.stdout"
+  changed_when: "'created' in fix_applied.stdout or 'configured' in fix_applied.stdout"
+  retries: 5
+  delay: 10
+  until: fix_applied.rc == 0
+
+- name: Wait for file descriptor fix DaemonSet to be available
+  ansible.builtin.shell: |
+    kubectl get daemonset file-descriptor-fix -n kube-system -o jsonpath='{.status.numberAvailable}'
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: ds_status
+  until: ds_status.stdout != "" and ds_status.stdout | int > 0
+  retries: 10
+  delay: 10
+  when: fix_applied is defined and fix_applied.changed
+  changed_when: false
+
+- name: Wait for file descriptor fix to take effect
+  pause:
+    seconds: 30
+  when: fix_applied is defined and fix_applied.changed
+
+- name: Display file descriptor limit fix status
+  debug:
+    msg: |
+      Applied K8s-based file descriptor limit fix to all K3s nodes.
+      This increases the containerd file descriptor limits to {{ min_file_descriptors | default('1048576') }}.
+      You may need to restart any pods stuck in ImagePullBackOff state.
+  when: fix_applied is defined and fix_applied.changed
+
+# Clean up any pods that are stuck after fixing the file descriptor limits
+- name: Create pod cleanup template
+  template:
+    src: pod-cleanup.yaml.j2
+    dest: /tmp/pod-cleanup.yaml
+  when: fix_applied is defined and fix_applied.changed
+
+- name: Apply pod cleanup using kubectl
+  ansible.builtin.shell: |
+    kubectl apply -f /tmp/pod-cleanup.yaml --validate=false
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: cleanup_pod_applied
+  when: fix_applied is defined and fix_applied.changed
+  changed_when: "'created' in cleanup_pod_applied.stdout or 'configured' in cleanup_pod_applied.stdout"
+  retries: 5
+  delay: 10
+  until: cleanup_pod_applied.rc == 0
+
+- name: Wait for pod cleanup to initialize
+  ansible.builtin.shell: |
+    kubectl get pod container-cleanup-pod -n kube-system -o jsonpath='{.status.phase}'
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: cleanup_pod_status
+  until: cleanup_pod_status.stdout != "Pending"
+  retries: 10
+  delay: 5
+  ignore_errors: true
+  when: cleanup_pod_applied is defined and cleanup_pod_applied.changed
+  changed_when: false
+
+- name: Wait for pod cleanup to complete
+  pause:
+    seconds: 30
+  when: cleanup_pod_applied is defined and cleanup_pod_applied.changed
+
+- name: Remove cleanup pod using kubectl
+  ansible.builtin.shell: |
+    kubectl delete pod container-cleanup-pod -n kube-system
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  when: cleanup_pod_applied is defined and cleanup_pod_applied.changed
+  changed_when: true
+
+- name: Check storage classes using kubectl
+  ansible.builtin.shell: |
+    kubectl get storageclasses -o name
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
   register: storage_classes
+  changed_when: false
 
-- name: Create local-path storage provisioner
-  kubernetes.core.k8s:
-    src: https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
-    state: present
-    kubeconfig: "{{ kubeconfig }}"
-  when: storage_classes.resources | length == 0
+- name: Create local-path storage provisioner using kubectl
+  ansible.builtin.shell: |
+    kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  when: storage_classes.stdout == ""
   register: local_path_result
+  changed_when: "'created' in local_path_result.stdout or 'configured' in local_path_result.stdout"
 
-- name: Set local-path as the default storage class
-  kubernetes.core.k8s_json_patch:
-    kind: StorageClass
-    name: local-path
-    kubeconfig: "{{ kubeconfig }}"
-    patch:
-      - op: add
-        path: /metadata/annotations/storageclass.kubernetes.io~1is-default-class
-        value: "true"
-  when: local_path_result is defined and local_path_result.changed
-  register: default_sc_result
+- name: Set local-path as the default storage class using kubectl
+  ansible.builtin.shell: |
+    kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  when: local_path_result is changed
+  register: default_storage_result
+  changed_when: "'patched' in default_storage_result.stdout"
 
 - name: Display storage class setup results
   debug:
-    msg: "Local-path storage provisioner installed and set as default"
-  when: default_sc_result is defined and default_sc_result.changed
+    msg: |
+      Storage class setup successful:
+      - Local Path Provisioner installed
+      - local-path set as default storage class
+  when: local_path_result is changed and default_storage_result is changed
 
 - name: Check if ingress-nginx namespace exists
-  kubernetes.core.k8s_info:
-    api_version: v1
-    kind: Namespace
-    name: ingress-nginx
-    kubeconfig: "{{ kubeconfig }}"
+  ansible.builtin.shell: |
+    kubectl get namespace ingress-nginx 2>/dev/null || echo "namespace not found"
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
   register: ingress_namespace
+  changed_when: false
   ignore_errors: true
 
 - name: Complete NGINX ingress controller cleanup
   block:
-    # First remove webhook configs to avoid validation issues
     - name: Remove validating webhook configuration
-      kubernetes.core.k8s:
-        kind: ValidatingWebhookConfiguration
-        name: ingress-nginx-admission
-        state: absent
-        kubeconfig: "{{ kubeconfig }}"
+      ansible.builtin.shell: |
+        kubectl delete ValidatingWebhookConfiguration ingress-nginx-admission 2>/dev/null || echo "webhook not found"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: webhook_result
+      changed_when: "'webhook not found' not in webhook_result.stdout"
       ignore_errors: true
 
     - name: Delete entire ingress-nginx namespace
-      kubernetes.core.k8s:
-        kind: Namespace
-        name: ingress-nginx
-        state: absent
-        kubeconfig: "{{ kubeconfig }}"
+      ansible.builtin.shell: |
+        kubectl delete namespace ingress-nginx --timeout=60s 2>/dev/null || echo "namespace not found"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: delete_ns_result
+      changed_when: "'namespace not found' not in delete_ns_result.stdout"
       ignore_errors: true
 
     - name: Wait for namespace deletion
-      kubernetes.core.k8s_info:
-        api_version: v1
-        kind: Namespace
-        name: ingress-nginx
-        kubeconfig: "{{ kubeconfig }}"
+      ansible.builtin.shell: |
+        kubectl get namespace ingress-nginx 2>/dev/null || echo "namespace not found"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
       register: ns_check
-      until: ns_check.resources | length == 0
-      retries: 15
-      delay: 5
+      until: "'namespace not found' in ns_check.stdout or ns_check.rc != 0"
+      retries: 30
+      delay: 10
       ignore_errors: true
+      changed_when: false
 
     - name: Display cleanup status
       debug:
         msg: "NGINX ingress controller namespace successfully removed"
-      when: ns_check.resources | length == 0
-  when: ingress_namespace.resources | length > 0
+      when: "'namespace not found' in ns_check.stdout or ns_check.rc != 0"
+  when: "'namespace not found' not in ingress_namespace.stdout"
 
-- name: Apply NGINX ingress controller manifest
-  shell: |
-    kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.12.1/deploy/static/provider/cloud/deploy.yaml
-  environment:
-    KUBECONFIG: "{{ kubeconfig }}"
-  register: ingress_result
-  changed_when: ingress_result.rc == 0
+- name: Apply NGINX ingress controller manifest with retries
+  block:
+    - name: Download ingress manifest
+      get_url:
+        url: https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.12.1/deploy/static/provider/cloud/deploy.yaml
+        dest: /tmp/ingress-nginx.yaml
+      register: download_result
+
+    - name: Apply NGINX ingress manifest with validation disabled
+      shell: |
+        kubectl apply -f /tmp/ingress-nginx.yaml --validate=false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: ingress_result
+      retries: 5
+      delay: 10
+      until: ingress_result.rc == 0
+      changed_when: ingress_result.rc == 0
+  rescue:
+    - name: Notify about API server connection issue
+      debug:
+        msg: |
+          WARNING: Unable to apply NGINX ingress controller due to K3s API server connection issues.
+          This may indicate that the K3s control plane is still initializing or restarting.
+          Please wait a few minutes and try running 'make prepare' again.
 
 - name: Display ingress controller setup results
   debug:
     msg: "NGINX ingress controller installed"
-  when: ingress_result is defined and ingress_result.changed
+  when: ingress_result is defined and ingress_result.rc == 0
+
+- name: Check if Longhorn is installed
+  ansible.builtin.shell: |
+    kubectl get namespace longhorn-system 2>/dev/null || echo "not found"
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: longhorn_check
+  changed_when: false
+  
+- name: Show Longhorn storage status
+  debug:
+    msg: |
+      Longhorn storage is installed and will be used for your OpenedX deployment.
+      Your data will be replicated across nodes for high availability.
+  when: "'not found' not in longhorn_check.stdout"
+  
+- name: Recommend Longhorn installation
+  debug:
+    msg: |
+      NOTE: For improved reliability, it's recommended to set up Longhorn storage
+      before deploying OpenedX by running: make setup-storage
+  when: "'not found' in longhorn_check.stdout"

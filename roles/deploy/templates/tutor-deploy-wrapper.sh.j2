@@ -1,0 +1,216 @@
+#!/bin/bash
+# Enhanced wrapper script for tutor k8s deployment with better error handling
+set -e
+
+KUBECONFIG="{{ kubeconfig }}"
+export KUBECONFIG
+TUTOR_BIN="{{ venv_dir }}/bin/tutor"
+MAX_RETRIES=5
+NAMESPACE="{{ openedx_namespace }}"
+API_SERVER="10.1.3.2:6443"  # The API server address from the error logs
+
+echo "Starting tutor deployment with improved wrapper..."
+echo "Using KUBECONFIG: $KUBECONFIG"
+
+function check_api_server() {
+  echo "Checking API server connectivity..."
+  
+  # First try direct TCP connection - more reliable than kubectl for basic connectivity
+  if ! timeout 5 bash -c "</dev/tcp/${API_SERVER%:*}/${API_SERVER#*:}" 2>/dev/null; then
+    echo "WARNING: API server not reachable via TCP. Waiting for connectivity..."
+    return 1
+  fi
+  
+  # Then check with kubectl to ensure API functionality
+  if ! kubectl get nodes --request-timeout=10s >/dev/null 2>&1; then
+    echo "WARNING: API server accepting connections but not responding to API requests."
+    return 1
+  fi
+  
+  echo "API server is reachable"
+  return 0
+}
+
+function check_file_descriptor_limits() {
+  local current_limit=$(ulimit -n)
+  local min_limit=65535
+  
+  echo "Current file descriptor limit: $current_limit"
+  if [ "$current_limit" -lt "$min_limit" ]; then
+    echo "WARNING: File descriptor limit is too low (minimum recommended: $min_limit)"
+    echo "Trying to increase for current session..."
+    ulimit -n $min_limit 2>/dev/null || echo "Could not increase limit for this session"
+    
+    echo "Applying node-wide fix for file descriptor limits..."
+    kubectl apply -f /tmp/node-file-limits.yaml --validate=false || true
+    
+    # Wait for fix to propagate
+    echo "Waiting 30s for file descriptor fix to propagate..."
+    sleep 30
+  fi
+}
+
+function clean_stuck_resources() {
+  echo "Cleaning up any stuck resources..."
+  
+  # Get namespace info
+  kubectl get namespace $NAMESPACE || {
+    echo "Namespace $NAMESPACE doesn't exist yet, creating it..."
+    kubectl create namespace $NAMESPACE --validate=false || true
+    sleep 5
+  }
+  
+  # Force delete any stuck terminating pods with safety check
+  local terminating_pods=$(kubectl get pods -n $NAMESPACE 2>/dev/null | grep Terminating | awk '{print $1}' || echo "")
+  if [ ! -z "$terminating_pods" ]; then
+    echo "Found pods stuck in Terminating state:"
+    echo "$terminating_pods" | tr ' ' '\n'
+    echo "$terminating_pods" | tr ' ' '\n' | xargs -r -I{} kubectl delete pod -n $NAMESPACE {} --force --grace-period=0 || true
+  fi
+  
+  # Delete pods with ImagePullBackOff
+  local pull_error_pods=$(kubectl get pods -n $NAMESPACE 2>/dev/null | grep ImagePullBackOff | awk '{print $1}' || echo "")
+  if [ ! -z "$pull_error_pods" ]; then
+    echo "Found pods with ImagePullBackOff errors:"
+    echo "$pull_error_pods" | tr ' ' '\n'
+    echo "$pull_error_pods" | tr ' ' '\n' | xargs -r -I{} kubectl delete pod -n $NAMESPACE {} || true
+  fi
+  
+  # Delete any failed jobs
+  local failed_jobs=$(kubectl get jobs -n $NAMESPACE 2>/dev/null | grep 0/1 | awk '{print $1}' || echo "")
+  if [ ! -z "$failed_jobs" ]; then
+    echo "Found failed jobs:"
+    echo "$failed_jobs" | tr ' ' '\n'
+    echo "$failed_jobs" | tr ' ' '\n' | xargs -r -I{} kubectl delete job -n $NAMESPACE {} || true
+  fi
+}
+
+function verify_registry_auth() {
+  echo "Verifying Docker registry authentication..."
+  if ! kubectl get secret -n $NAMESPACE dockerhub-creds >/dev/null 2>&1; then
+    echo "dockerhub-creds secret not found, creating it..."
+    
+    # Create registry auth from environment variables if available
+    if [ ! -z "$DOCKER_USERNAME" ] && [ ! -z "$DOCKER_TOKEN" ]; then
+      kubectl create secret docker-registry dockerhub-creds \
+        --namespace=$NAMESPACE \
+        --docker-server=docker.io \
+        --docker-username="$DOCKER_USERNAME" \
+        --docker-password="$DOCKER_TOKEN" \
+        --docker-email="${DOCKER_EMAIL:-noreply@example.com}" || true
+    else
+      echo "WARNING: Docker registry credentials not found in environment. This may cause rate limiting issues."
+      return 1
+    fi
+  fi
+  
+  # Patch service accounts to use registry auth
+  kubectl patch serviceaccount default -n $NAMESPACE --patch '{"imagePullSecrets": [{"name": "dockerhub-creds"}]}' 2>/dev/null || true
+  
+  echo "Docker registry authentication configured."
+  return 0
+}
+
+function deploy_with_retries() {
+  local retry_count=0
+  local success=false
+  
+  # Check file descriptor limits first
+  check_file_descriptor_limits
+  
+  # Verify registry authentication
+  verify_registry_auth || echo "WARNING: Registry authentication may not be properly configured."
+  
+  while [ $retry_count -lt $MAX_RETRIES ]; do
+    retry_count=$((retry_count + 1))
+    echo "Deployment attempt $retry_count of $MAX_RETRIES"
+    
+    # Check API server connectivity first with longer timeout for first attempt
+    local api_check_timeout=$((retry_count * 20))
+    if [ $api_check_timeout -gt 60 ]; then
+      api_check_timeout=60
+    fi
+    
+    echo "Checking API server with ${api_check_timeout}s timeout..."
+    if timeout $api_check_timeout bash -c 'until check_api_server; do sleep 5; done'; then
+      echo "API server is responsive."
+    else
+      echo "API server not responsive after ${api_check_timeout}s. Waiting before retry..."
+      sleep 30
+      continue
+    fi
+    
+    # Clean stuck resources before each attempt
+    clean_stuck_resources
+    
+    # Create the openedx namespace if it doesn't exist
+    kubectl get namespace $NAMESPACE 2>/dev/null || kubectl create namespace $NAMESPACE --validate=false
+    
+    # Run tutor to create resources directly with staged approach and timeouts
+    echo "Running tutor k8s quickstart directly..."
+    
+    # Step 1: Save configuration with reduced resource requirements
+    echo "Step 1: Saving tutor configuration..."
+    if ! $TUTOR_BIN config save --set K8S_RESOURCES_REQUESTS_ENABLED=false; then
+      echo "Failed to save tutor config. API server may be unstable."
+      sleep 20
+      continue
+    fi
+    
+    # Step 2: Generate Kubernetes manifests
+    echo "Step 2: Generating Kubernetes manifests..."
+    if ! $TUTOR_BIN config save; then
+      echo "Failed to generate Kubernetes manifests. API server may be unstable."
+      sleep 20
+      continue
+    fi
+    
+    # Step 3: Apply manifests using kubectl directly with retry
+    echo "Step 3: Applying Kubernetes manifests..."
+    $TUTOR_BIN k8s start
+    start_result=$?
+    
+    if [ $start_result -ne 0 ]; then
+      echo "Tutor k8s start failed. Trying alternative apply method..."
+      # Fallback to direct kubectl apply with retries
+      for i in {1..3}; do
+        echo "Attempt $i: Applying manifests using kubectl directly..."
+        kubectl apply -k $HOME/.local/share/tutor/env --validate=false --selector 'app.kubernetes.io/component notin (job,namespace)' && {
+          echo "Manual manifest application succeeded!"
+          break
+        }
+        sleep 10
+      done
+    fi
+    
+    # Step 4: Initialize OpenedX
+    echo "Step 4: Initializing OpenedX..."
+    if $TUTOR_BIN k8s init; then
+      echo "Tutor deployment completed successfully!"
+      success=true
+      break
+    else
+      echo "Tutor deployment failed on attempt $retry_count. Cleaning up and waiting before retry..."
+      clean_stuck_resources
+      sleep $((retry_count * 15))  # Increasing backoff between retries
+    fi
+  done
+  
+  if [ "$success" = true ]; then
+    return 0
+  else
+    echo "ERROR: Deployment failed after $MAX_RETRIES attempts."
+    echo "Collecting diagnostic information..."
+    echo "Pod status:"
+    kubectl get pods -n $NAMESPACE || true
+    echo "PVC status:"
+    kubectl get pvc -n $NAMESPACE || true
+    echo "Events:"
+    kubectl get events -n $NAMESPACE --sort-by='.lastTimestamp' | tail -20 || true
+    
+    return 1
+  fi
+}
+
+# Execute the tutor deployment with our custom retry logic
+deploy_with_retries

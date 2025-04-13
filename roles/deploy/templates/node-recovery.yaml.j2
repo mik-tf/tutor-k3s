@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-recovery-agent
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: node-recovery-agent
+  template:
+    metadata:
+      labels:
+        app: node-recovery-agent
+    spec:
+      tolerations:
+      - key: node.kubernetes.io/unreachable
+        operator: Exists
+        effect: NoSchedule
+      - key: node.kubernetes.io/not-ready
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: recovery-agent
+        image: docker.io/ubuntu:22.04
+        command: 
+        - sleep
+        - "3600"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: host-root
+          mountPath: /host
+      volumes:
+      - name: host-root
+        hostPath:
+          path: /

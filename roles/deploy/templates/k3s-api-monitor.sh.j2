@@ -1,0 +1,106 @@
+#!/bin/bash
+# K3s API Server Health Monitor
+
+set -e
+
+KUBECONFIG="{{ kubeconfig }}"
+export KUBECONFIG
+MAX_RETRIES=20
+RETRY_INTERVAL=15
+API_SERVER="10.1.3.2:6443"  # The API server address from the error logs
+
+function check_api_connectivity() {
+  # TCP connection check (more reliable than kubectl)
+  if timeout 5 bash -c "</dev/tcp/${API_SERVER%:*}/${API_SERVER#*:}" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+function recover_k3s() {
+  echo "Attempting to diagnose and recover K3s cluster..."
+  
+  # Try to get node status to assess cluster
+  kubectl get nodes -o wide || true
+  
+  # Check for potential resource pressure
+  echo "Checking for resource pressure..."
+  local high_pressure=$(kubectl get nodes -o json 2>/dev/null | jq -r '.items[].status.conditions[] | select(.type=="MemoryPressure" or .type=="DiskPressure" or .type=="PIDPressure") | select(.status=="True") | .type' || echo "")
+  
+  if [[ -n "$high_pressure" ]]; then
+    echo "Detected $high_pressure on node(s). Attempting to free resources..."
+    
+    # Clean up completed pods and failed jobs to free resources
+    kubectl delete pods --field-selector=status.phase==Succeeded --all-namespaces || true
+    kubectl delete pods --field-selector=status.phase==Failed --all-namespaces || true
+    kubectl delete jobs --field-selector=status.succeeded=1 --all-namespaces || true
+    
+    # Give the system time to reclaim resources
+    sleep 10
+  fi
+}
+
+function wait_for_api_server() {
+  echo "Starting enhanced K3s API server connectivity check..."
+  
+  local attempt=1
+  
+  while [ $attempt -le $MAX_RETRIES ]; do
+    echo "Attempt $attempt/$MAX_RETRIES: Checking API server connectivity..."
+    
+    if check_api_connectivity; then
+      echo "→ API server is reachable via direct TCP connection"
+      
+      # Also check with kubectl for API functionality
+      if kubectl get namespaces --request-timeout=10s >/dev/null 2>&1; then
+        echo "→ API server is fully functional!"
+        return 0
+      else
+        echo "→ API server accepts connections but may not be fully initialized yet"
+      fi
+    else
+      echo "→ API server is not reachable via TCP"
+    fi
+    
+    # Recovery attempt every third try
+    if [ $((attempt % 3)) -eq 0 ]; then
+      recover_k3s
+    fi
+    
+    # Exponential backoff with a cap
+    local backoff=$((5 + (attempt * 2)))
+    if [ $backoff -gt 30 ]; then
+      backoff=30
+    fi
+    
+    echo "Waiting $backoff seconds before next attempt..."
+    sleep $backoff
+    attempt=$((attempt + 1))
+  done
+  
+  echo "Failed to establish stable connection to K3s API server after maximum retries."
+  return 1
+}
+
+# Run the API server check
+wait_for_api_server
+exit_code=$?
+
+if [ $exit_code -eq 0 ]; then
+  echo "K3s API server is healthy and ready."
+else
+  echo "K3s API server is not responding reliably. Please check your cluster."
+  
+  # Output diagnostic information that might help
+  echo ""
+  echo "=== DIAGNOSTIC INFORMATION ==="
+  echo "API Server: $API_SERVER"
+  echo "Direct TCP check result: $(check_api_connectivity && echo 'Success' || echo 'Failed')"
+  ping -c 3 ${API_SERVER%:*} || true
+  
+  # Check for k3s process on the machine if it's accessible
+  echo "Checking K3s service status if accessible..."
+  ssh -o ConnectTimeout=5 ${API_SERVER%:*} "systemctl status k3s" || true
+  
+  exit 1
+fi

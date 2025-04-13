@@ -54,10 +54,9 @@ cd tutor-k3s
 
 ```bash
 # Docker Hub credentials (optional but recommended to avoid rate limits)
+cp .env.example .env # Then set username and email
 set +o history  # Disable command history for security
-export DOCKER_USERNAME="your_dockerhub_username"
 export DOCKER_TOKEN="your_dockerhub_token"
-export DOCKER_EMAIL="your_email"
 set -o history  # Re-enable command history
 ```
 
@@ -72,6 +71,9 @@ make prepare
 
 # Configure Docker registry authentication (if you set credentials above)
 make registry-auth
+
+# Set up Longhorn storage
+make setup-storage
 
 # Deploy Open edX
 make deploy

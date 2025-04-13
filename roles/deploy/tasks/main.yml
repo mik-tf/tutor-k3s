@@ -18,24 +18,53 @@
   ignore_errors: true
   changed_when: false
 
+- name: Include API health check
+  include_tasks: api_health_check.yml
+
 - name: Fail if tutor is not installed
   fail:
     msg: "Error: tutor is not installed or not in PATH. Please make sure you've run the setup role first."
   when: tutor_check.rc != 0
 
-- name: Ensure KUBECONFIG is set
-  ansible.builtin.set_fact:
-    kubeconfig: "{{ tfgrid_dir }}/k3s.yaml"
+# Kubeconfig already defined in group_vars/all.yml
 
-- name: Check if KUBECONFIG file exists
-  ansible.builtin.stat:
-    path: "{{ kubeconfig }}"
-  register: kubeconfig_file
+- name: Wait for K3s API server to be ready
+  ansible.builtin.shell: |
+    echo "Checking if K3s API server is ready..."
+    for i in $(seq 1 18); do
+      if kubectl get nodes &>/dev/null; then
+        echo "API server is ready!"
+        exit 0
+      fi
+      echo "Attempt $i/18: API server not ready yet, waiting 10 seconds..."
+      sleep 10
+    done
+    echo "API server still not ready after 3 minutes."
+    exit 1
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: k8s_api_check
+  ignore_errors: true
+  changed_when: false
 
-- name: Fail if KUBECONFIG file doesn't exist
+- name: Display API server status
+  debug:
+    msg: |
+      K3s API Server Status: {{ "READY" if k8s_api_check.rc == 0 else "NOT READY" }}
+      
+      The API server must be ready before deployment can proceed.
+      If not ready, please check your K3s cluster:
+      
+      ssh root@<node-ip> "systemctl status k3s"
+      
+      You may need to wait longer for initialization or restart K3s:
+      
+      ssh root@<node-ip> "systemctl restart k3s"
+  
+- name: Fail if API server is not ready after maximum retries
   fail:
-    msg: "Error: KUBECONFIG file doesn't exist: {{ kubeconfig }}. Please make sure you've deployed a K3s cluster with tfgrid-k3s first."
-  when: not kubeconfig_file.stat.exists
+    msg: "Kubernetes API server is not ready after 3 minutes of retries. Please check your K3s cluster and retry."
+  when: k8s_api_check.rc != 0
 
 - name: Check file descriptor limits
   ansible.builtin.shell: ulimit -n
@@ -75,24 +104,24 @@
   when: current_limit.stdout | int < min_file_descriptors | int and new_limit.stdout | int <= current_limit.stdout | int
 
 - name: Clean up any existing failed deployment
-  kubernetes.core.k8s:
-    kind: "{{ item.kind }}"
-    namespace: "{{ openedx_namespace }}"
-    state: absent
-    kubeconfig: "{{ kubeconfig }}"
-  loop:
-    - { kind: "Job" }
-    - { kind: "ConfigMap" }
-  register: cleanup_result
+  ansible.builtin.shell: |
+    kubectl delete jobs --all -n {{ openedx_namespace }} 2>/dev/null || true
+    kubectl delete configmaps --all -n {{ openedx_namespace }} 2>/dev/null || true
+  args:
+    executable: /bin/bash
   ignore_errors: true
+  changed_when: false
 
 - name: Create openedx namespace if it doesn't exist
-  kubernetes.core.k8s:
-    api_version: v1
-    kind: Namespace
-    name: "{{ openedx_namespace }}"
-    state: present
-    kubeconfig: "{{ kubeconfig }}"
+  ansible.builtin.shell: |
+    kubectl create namespace {{ openedx_namespace }} --dry-run=client -o yaml | kubectl apply -f - 
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: namespace_result
+  retries: 5
+  delay: 10
+  until: namespace_result.rc == 0 or "AlreadyExists" in namespace_result.stderr
+  changed_when: "'created' in namespace_result.stdout | default('')"
 
 - name: Check if plugins are enabled
   ansible.builtin.command: "{{ venv_dir }}/bin/tutor plugins list"
@@ -130,17 +159,66 @@
   when: "'ecommerce.*enabled' not in plugins_list.stdout"
 
 - name: Check if Docker registry authentication is configured
-  kubernetes.core.k8s_info:
-    kind: Secret
-    name: dockerhub-creds
-    namespace: "{{ openedx_namespace }}"
-    kubeconfig: "{{ kubeconfig }}"
+  ansible.builtin.shell: |
+    kubectl get secret dockerhub-creds -n {{ openedx_namespace }} -o name || echo "not found"
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
   register: registry_auth
+  retries: 3
+  delay: 5
+  until: registry_auth.rc == 0
+  changed_when: false
+  failed_when: false
 
 - name: Configure Docker registry authentication if needed
   include_role:
     name: registry
-  when: registry_auth.resources | length == 0
+  when: registry_auth.stdout == "not found"
+
+- name: Check for Longhorn storage classes
+  ansible.builtin.shell: |
+    kubectl get storageclass -o json | jq -r '.items[] | select(.provisioner == "driver.longhorn.io") | .metadata.name'
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: longhorn_sc
+  changed_when: false
+  ignore_errors: true
+
+- name: Display Longhorn storage classes if available
+  debug:
+    msg: "Found Longhorn storage classes: {{ longhorn_sc.stdout_lines }}"
+  when: longhorn_sc.rc == 0 and longhorn_sc.stdout_lines | length > 0
+
+- name: Configure Tutor to use Longhorn storage
+  block:
+    - name: Check for DB-optimized storage class
+      ansible.builtin.shell: |
+        kubectl get storageclass longhorn-db-performance 2>/dev/null || echo "not found"
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: db_sc_check
+      changed_when: false
+      
+    - name: Set default storage class for all PVCs
+      ansible.builtin.command: "{{ venv_dir }}/bin/tutor config save --set KUBERNETES_STORAGE_CLASS=longhorn"
+      register: storage_config
+      changed_when: storage_config.rc == 0
+      
+    - name: Configure optimized storage classes for databases
+      ansible.builtin.shell: |
+        {{ venv_dir }}/bin/tutor config save --set KUBERNETES_PVC_STORAGE_CLASS_MYSQL="longhorn-db-performance"
+        {{ venv_dir }}/bin/tutor config save --set KUBERNETES_PVC_STORAGE_CLASS_MONGODB="longhorn-db-performance"
+        {{ venv_dir }}/bin/tutor config save --set KUBERNETES_PVC_STORAGE_CLASS_ELASTICSEARCH="longhorn-db-performance"
+      changed_when: true
+      when: "'not found' not in db_sc_check.stdout"
+      
+    - name: Display storage configuration message
+      debug:
+        msg: |
+          Configured Tutor to use Longhorn storage for high availability.
+          - Default storage class: longhorn
+          - Database storage class: {{ 'longhorn-db-performance' if 'not found' not in db_sc_check.stdout else 'longhorn' }}
+  when: longhorn_sc.rc == 0 and longhorn_sc.stdout_lines | length > 0
 
 - name: Configure Tutor with proper hostnames and settings
   ansible.builtin.command: "{{ venv_dir }}/bin/tutor config save --set LMS_HOST={{ lms_host }} --set CMS_HOST={{ cms_host }}"
@@ -166,8 +244,39 @@
   ansible.builtin.command: "{{ venv_dir }}/bin/tutor config save"
   changed_when: true
 
-- name: Deploy Open edX on Kubernetes
-  ansible.builtin.command: "{{ venv_dir }}/bin/tutor k8s start"
+- name: Create tutor deployment wrapper script
+  ansible.builtin.template:
+    src: tutor-deploy-wrapper.sh.j2
+    dest: /tmp/tutor-deploy-wrapper.sh
+    mode: '0755'
+
+- name: Create resource reducer script
+  ansible.builtin.template:
+    src: resource-reducer.yaml.j2
+    dest: /tmp/resource-reducer.yaml
+    mode: '0644'
+
+- name: Execute resource reducer
+  ansible.builtin.shell: |
+    # Apply and run the resource reducer
+    kubectl apply -f /tmp/resource-reducer.yaml
+    
+    # Directly apply resource reductions
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_REQUESTS_ENABLED=false
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_LIMITS_ENABLED=true
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_LMS_LIMITS_CPU=1
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_LMS_LIMITS_MEMORY=1Gi
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_CMS_LIMITS_CPU=1
+    {{ venv_dir }}/bin/tutor config save --set K8S_RESOURCES_CMS_LIMITS_MEMORY=1Gi
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: resource_reduction
+  changed_when: resource_reduction.rc == 0
+
+- name: Deploy Open edX on Kubernetes using resilient wrapper
+  ansible.builtin.shell: /tmp/tutor-deploy-wrapper.sh
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
   register: deploy_result
   changed_when: true
 
@@ -197,12 +306,50 @@
   changed_when: false
   ignore_errors: true
 
+# Add node recovery and PVC remedy solutions for node unreachable issues
+- name: Create node recovery template file
+  ansible.builtin.template:
+    src: node-recovery.yaml.j2
+    dest: /tmp/node-recovery.yaml
+
+- name: Create PVC remedy template file
+  ansible.builtin.template:
+    src: pvc-remedy.yaml.j2
+    dest: /tmp/pvc-remedy.yaml
+
+- name: Apply node recovery daemonset
+  ansible.builtin.shell: |
+    kubectl apply -f /tmp/node-recovery.yaml
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: node_recovery_result
+  changed_when: node_recovery_result.rc == 0
+  failed_when: false
+
+- name: Display node recovery status
+  debug:
+    msg: "Node recovery DaemonSet applied: {{ node_recovery_result.stdout }}"
+
+- name: Apply PVC remedy job
+  ansible.builtin.shell: |
+    kubectl apply -f /tmp/pvc-remedy.yaml
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: pvc_remedy_result
+  changed_when: pvc_remedy_result.rc == 0
+  failed_when: false
+
+- name: Display PVC remedy status
+  debug:
+    msg: "PVC remedy resources applied: {{ pvc_remedy_result.stdout }}"
+
 - name: Wait for pods to be ready
   block:
     - name: Set retry count
       ansible.builtin.set_fact:
         retry_count: 0
         all_ready: false
+        max_retries: 45  # Increased from default 30 for better reliability
         
     - name: Check pod status with retry
       ansible.builtin.shell: |
@@ -250,7 +397,7 @@
           exit 1
         fi
       register: pod_status
-      retries: 30
+      retries: "{{ max_retries | default(30) }}"
       delay: 30
       until: pod_status.stdout_lines[-1] == "all_ready=true" or pod_status.stdout_lines[-2] == "container_creating=0"
       
@@ -289,6 +436,25 @@
   ansible.builtin.command: "{{ venv_dir }}/bin/tutor k8s init"
   ignore_errors: true
   changed_when: true
+
+- name: Check if Longhorn is being used
+  ansible.builtin.shell: |
+    kubectl get pvc -n {{ openedx_namespace }} -o json | jq -r '.items[] | select(.spec.storageClassName | contains("longhorn")) | .metadata.name' || echo ""
+  register: longhorn_pvcs
+  ignore_errors: true
+  changed_when: false
+
+- name: Display high-availability storage status
+  debug:
+    msg: |
+      Your OpenedX instance is using Longhorn high-availability storage!
+      PVCs using Longhorn: {{ longhorn_pvcs.stdout_lines | join(', ') }}
+      
+      Benefits:
+      - Data is replicated across multiple nodes
+      - Pods can be rescheduled to any node if a node fails
+      - Automatic volume healing if a node recovers
+  when: longhorn_pvcs.stdout_lines | length > 0
 
 - name: Display deployment information
   debug:

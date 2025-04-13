@@ -1,0 +1,66 @@
+---
+# Common tasks for K3s cluster verification
+
+- name: Verify K3s API server connection using kubectl
+  block:
+    - name: Try to get nodes with kubectl
+      ansible.builtin.shell: |
+        kubectl get nodes
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: kubectl_api_check
+      retries: 5
+      delay: 10
+      until: kubectl_api_check.rc == 0
+      changed_when: false
+  rescue:
+    - name: Set API check failure flag
+      set_fact:
+        api_check_failed: true
+    
+    - name: Warn if Kubernetes API is not accessible
+      debug:
+        msg: |
+          WARNING: Unable to connect to Kubernetes API using kubeconfig: {{ kubeconfig }}
+          This may indicate a problem with your K3s cluster or kubeconfig file.
+          Please ensure your K3s cluster is running and the kubeconfig path is correct.
+
+    - name: Check if kubectl config view works
+      ansible.builtin.shell: |
+        kubectl config view --raw
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: kubectl_config_check
+      changed_when: false
+      failed_when: false
+
+    - name: Display kubeconfig content if available
+      debug:
+        msg: |
+          Kubeconfig file exists but API server is unreachable.
+          Please check if the K3s API server is running at the address specified in the kubeconfig.
+          The server address in the kubeconfig is likely 10.1.3.2:6443.
+      when: kubectl_config_check.rc == 0
+
+    - name: Try ping API server as backup check
+      ansible.builtin.shell: |
+        ping -c 3 10.1.3.2 || echo "ICMP ping failed"
+      register: ping_check
+      changed_when: false
+      failed_when: false
+
+    - name: Display ping results
+      debug:
+        msg: "{{ ping_check.stdout }}"
+
+    - name: Fail if Kubernetes API is not accessible
+      fail:
+        msg: |
+          Failed to connect to Kubernetes API. 
+          Make sure your K3s cluster is running and accessible.
+          Kubeconfig path: {{ kubeconfig }}
+          
+          Troubleshooting:
+          1. Check if all K3s services are running on your control plane nodes
+          2. Verify network connectivity to 10.1.3.2:6443
+          3. Manually run 'kubectl get nodes' to see specific error messages

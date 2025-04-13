@@ -1,5 +1,11 @@
 .PHONY: help setup prepare registry-auth deploy cleanup reset copy-k3s-config system
 
+# Set environment variables from .env file
+ifneq (,$(wildcard ./.env))
+    include .env
+    export
+endif
+
 help: ## Show this help
 	@echo "Tutor K3s Ansible - Open edX on K3s using Ansible"
 	@echo ""
@@ -11,6 +17,10 @@ help: ## Show this help
 copy-k3s-config: ## Copy k3s config to local directory
 	mkdir -p config
 	cp ../tfgrid-k3s/k3s.yaml config/k3s.yaml
+
+k3s-health: copy-k3s-config ## Check K3s API server health and provide troubleshooting
+	@echo "Running K3s health check and troubleshooting..."
+	KUBECONFIG=$(CURDIR)/config/k3s.yaml bash -c 'bash $(CURDIR)/roles/deploy/templates/k3s-api-monitor.sh'
 
 system: copy-k3s-config ## Run the system role playbook
 	KUBECONFIG=config/k3s.yaml ansible-playbook roles/system/tasks/main.yml
@@ -24,6 +34,9 @@ prepare: copy-k3s-config ## Prepare Kubernetes for Tutor (namespace, plugins, st
 registry-auth: copy-k3s-config ## Configure Docker registry authentication
 	KUBECONFIG=$(CURDIR)/config/k3s.yaml ansible-playbook playbooks/registry-auth.yml
 
+setup-storage: copy-k3s-config ## Set up Longhorn storage for OpenedX
+	KUBECONFIG=$(CURDIR)/config/k3s.yaml ansible-playbook playbooks/setup-storage.yml
+
 deploy: copy-k3s-config ## Deploy Open edX on Kubernetes
 	KUBECONFIG=$(CURDIR)/config/k3s.yaml ansible-playbook playbooks/deploy.yml
 
@@ -33,4 +46,4 @@ cleanup: copy-k3s-config ## Clean up stuck pods
 reset: copy-k3s-config ## Reset the Open edX deployment
 	KUBECONFIG=$(CURDIR)/config/k3s.yaml ansible-playbook playbooks/reset.yml
 
-all: copy-k3s-config setup prepare registry-auth deploy ## Run all steps in sequence
+all: copy-k3s-config setup prepare registry-auth setup-storage deploy ## Run all steps in sequence
