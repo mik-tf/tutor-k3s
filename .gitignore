@@ -31,6 +31,10 @@ wheels/
 .env
 .env.local
 
+# Virtual Environment
+venv/
+env/
+
 # IDE specific
 .idea/
 .vscode/
